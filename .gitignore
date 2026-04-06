@@ -1,0 +1,11 @@
+﻿.env
+*.pem
+*.log
+__pycache__/
+*.pyc
+logs/
+output/
+downloads/
+user_data/
+.tmp*/
+tmp*/
