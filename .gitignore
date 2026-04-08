@@ -9,3 +9,5 @@ downloads/
 user_data/
 .tmp*/
 tmp*/
+dist/
+release/

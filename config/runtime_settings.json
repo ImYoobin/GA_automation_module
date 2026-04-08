@@ -1,0 +1,6 @@
+{
+  "browser": "msedge",
+  "output_dir": "%USERPROFILE%\\GoogleAdsExport\\output",
+  "downloads_dir": "%USERPROFILE%\\GoogleAdsExport\\downloads",
+  "logs_dir": "%USERPROFILE%\\GoogleAdsExport\\logs"
+}

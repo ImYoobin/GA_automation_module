@@ -64,9 +64,21 @@ def _focus_browser_page(page, logger=None) -> None:
 
 
 def _minimize_browser_page(page, logger=None) -> None:
-    minimized = minimize_browser_window(page, logger=logger)
+    pages = [page]
+    try:
+        context_pages = [candidate for candidate in page.context.pages if not candidate.is_closed()]
+        if context_pages:
+            pages = context_pages
+    except Exception:  # noqa: BLE001
+        pages = [page]
+
+    success = False
+    for candidate in pages:
+        minimized = minimize_browser_window(candidate, logger=logger)
+        success = success or minimized
+
     if logger:
-        logger.info("browser minimize requested | success=%s", minimized)
+        logger.info("browser minimize keepalive | success=%s | page_count=%s", success, len(pages))
 
 
 def _account_to_dict(account: AdsAccount) -> dict[str, Any]:
@@ -632,6 +644,7 @@ def scan_selected_accounts(
 
             for selected in selected_accounts:
                 account = discovered_by_cid.get(selected.cid_digits, selected)
+                _minimize_browser_page(page, logger=logger)
                 for target_key in TARGET_ORDER:
                     _emit(
                         progress_cb,
@@ -792,6 +805,7 @@ def run_google_export_for_accounts(
                 for selected in selected_accounts:
                     account = discovered_by_cid.get(selected.cid_digits, selected)
                     account_label = f"{account.name} | {account.cid}"
+                    _minimize_browser_page(page, logger=logger)
                     matched_map: dict[str, SavedReportItem] = (
                         scan_results.get(selected.cid_digits, {}).get("matched_map", {})
                     )
@@ -800,6 +814,7 @@ def run_google_export_for_accounts(
 
                     try:
                         ensure_account_report_editor_ready(page=page, account=account, logger=logger)
+                        _minimize_browser_page(page, logger=logger)
                         _emit(
                             progress_cb,
                             {
@@ -851,6 +866,7 @@ def run_google_export_for_accounts(
                             1 for result in result_by_target.values() if result.success and result.filename
                         )
                         if failed_retry_targets:
+                            _minimize_browser_page(page, logger=logger)
                             _emit(
                                 progress_cb,
                                 {

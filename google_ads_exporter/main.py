@@ -948,6 +948,9 @@ def run() -> int:
                     logger.info("post-account-selection minimize | success=%s", minimized)
 
                 for account in selected_accounts:
+                    if not headless:
+                        minimized = minimize_browser_window(page, logger=logger)
+                        logger.info("keepalive minimize before account | cid=%s | success=%s", account.cid, minimized)
                     logger.info("processing account=%s (%s)", account.name, account.cid)
                     result = process_account(
                         page=page,

@@ -1,0 +1,3 @@
+-r requirements.google.runtime.txt
+pyinstaller>=6.0.0
+pyinstaller-hooks-contrib>=2025.0

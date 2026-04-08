@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 import os
+import re
 import subprocess
 import sys
 import time
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any
 
 import pandas as pd
@@ -44,6 +46,21 @@ STATUS_STYLE = {
     "failed": "background-color: #fee2e2; color: #b91c1c; font-weight: 700;",
 }
 
+RUNTIME_SETTINGS_RELATIVE_PATH = Path("config") / "runtime_settings.json"
+RUNTIME_PATH_KEYS: tuple[str, ...] = ("output_dir", "downloads_dir", "logs_dir")
+RUNTIME_INPUT_KEY_BY_PATH_KEY: dict[str, str] = {
+    "output_dir": "output_dir_input",
+    "downloads_dir": "downloads_dir_input",
+    "logs_dir": "logs_dir_input",
+}
+DEFAULT_USER_BASE_DIR = Path.home() / "GoogleAdsExport"
+DEFAULT_USER_OUTPUT_DIR = DEFAULT_USER_BASE_DIR / "output"
+DEFAULT_USER_DOWNLOADS_DIR = DEFAULT_USER_BASE_DIR / "downloads"
+DEFAULT_USER_LOGS_DIR = DEFAULT_USER_BASE_DIR / "logs"
+INVALID_RUNTIME_PATH_MESSAGE = "올바르지 않은 경로입니다. 로컬 PC 경로를 입력해주세요."
+_WINDOWS_ABS_DRIVE_RE = re.compile(r"^[A-Za-z]:\\")
+_WINDOWS_DRIVE_TOKEN_RE = re.compile(r"[A-Za-z]:\\")
+
 
 def run_streamlit_app() -> None:
     st.set_page_config(page_title="Google Ads Exporter", layout="wide")
@@ -66,6 +83,10 @@ def run_streamlit_app() -> None:
     st.markdown("⚙️ 좌측 사이드바에서 Run Settings를 설정합니다.")
 
     _render_sidebar_execution_section(snapshot)
+    runtime_path_error = _safe_text(st.session_state.pop("_runtime_path_error", ""))
+    if runtime_path_error:
+        st.warning(runtime_path_error)
+    _persist_runtime_settings(force=bool(st.session_state.get("_runtime_settings_needs_heal")))
 
     _render_step_header("📋 Export할 Account 선택하기")
     _render_account_selection_flow(snapshot)
@@ -84,7 +105,137 @@ def _safe_text(value: Any) -> str:
 
 
 def _safe_path(path_text: str) -> Path:
-    return Path(path_text).expanduser().resolve()
+    expanded = _safe_text(os.path.expandvars(path_text))
+    return Path(expanded).expanduser().resolve()
+
+
+def _default_runtime_settings() -> dict[str, str]:
+    return {
+        "browser": "msedge",
+        "output_dir": str(DEFAULT_USER_OUTPUT_DIR),
+        "downloads_dir": str(DEFAULT_USER_DOWNLOADS_DIR),
+        "logs_dir": str(DEFAULT_USER_LOGS_DIR),
+    }
+
+
+def _validate_runtime_path(value: Any, *, check_writable: bool) -> tuple[bool, str]:
+    raw_value = _safe_text(value)
+    if not raw_value:
+        return False, INVALID_RUNTIME_PATH_MESSAGE
+
+    expanded = _safe_text(os.path.expandvars(raw_value))
+    candidate = expanded.replace("/", "\\")
+
+    if not _WINDOWS_ABS_DRIVE_RE.match(candidate):
+        return False, INVALID_RUNTIME_PATH_MESSAGE
+
+    drive_tokens = _WINDOWS_DRIVE_TOKEN_RE.findall(candidate)
+    if len(drive_tokens) != 1:
+        return False, INVALID_RUNTIME_PATH_MESSAGE
+
+    lowered = candidate.lower()
+    if "\\onedrive" in lowered:
+        return False, INVALID_RUNTIME_PATH_MESSAGE
+
+    invalid_chars = set('<>:"|?*')
+    for part in PureWindowsPath(candidate).parts[1:]:
+        segment = _safe_text(part).rstrip("\\/")
+        if not segment:
+            continue
+        if any(char in invalid_chars for char in segment):
+            return False, INVALID_RUNTIME_PATH_MESSAGE
+
+    normalized = str(Path(candidate).expanduser())
+    if check_writable:
+        try:
+            target_dir = Path(normalized)
+            target_dir.mkdir(parents=True, exist_ok=True)
+            probe_path = target_dir / f".path_probe_{time.time_ns()}.tmp"
+            probe_path.write_text("ok", encoding="utf-8")
+            probe_path.unlink(missing_ok=True)
+        except Exception:
+            return False, INVALID_RUNTIME_PATH_MESSAGE
+
+    return True, normalized
+
+
+def _sanitize_loaded_runtime_settings(runtime_settings: dict[str, str]) -> tuple[dict[str, str], bool]:
+    defaults = _default_runtime_settings()
+    sanitized = dict(defaults)
+    has_invalid = False
+
+    raw_browser = _safe_text(runtime_settings.get("browser")).lower()
+    if raw_browser:
+        if raw_browser in {"msedge", "chrome", "auto", "chromium"}:
+            sanitized["browser"] = raw_browser
+        else:
+            has_invalid = True
+
+    for path_key in RUNTIME_PATH_KEYS:
+        raw_value = _safe_text(runtime_settings.get(path_key))
+        if not raw_value:
+            if path_key in runtime_settings:
+                has_invalid = True
+            continue
+        is_valid, normalized_or_message = _validate_runtime_path(raw_value, check_writable=False)
+        if is_valid:
+            sanitized[path_key] = normalized_or_message
+        else:
+            has_invalid = True
+
+    return sanitized, has_invalid
+
+
+def _push_runtime_path_warning() -> None:
+    st.session_state["_runtime_path_error"] = INVALID_RUNTIME_PATH_MESSAGE
+
+
+def _on_runtime_path_input_change(path_key: str) -> None:
+    input_key = RUNTIME_INPUT_KEY_BY_PATH_KEY[path_key]
+    candidate = _safe_text(st.session_state.get(input_key))
+    is_valid, normalized_or_message = _validate_runtime_path(candidate, check_writable=False)
+    if is_valid:
+        st.session_state[path_key] = normalized_or_message
+        st.session_state[f"_runtime_valid_{path_key}"] = normalized_or_message
+        return
+
+    fallback = _safe_text(st.session_state.get(f"_runtime_valid_{path_key}"))
+    if not fallback:
+        fallback = _default_runtime_settings()[path_key]
+    st.session_state[path_key] = fallback
+    st.session_state[f"_runtime_valid_{path_key}"] = fallback
+    _push_runtime_path_warning()
+
+
+def _on_output_dir_input_change() -> None:
+    _on_runtime_path_input_change("output_dir")
+
+
+def _on_downloads_dir_input_change() -> None:
+    _on_runtime_path_input_change("downloads_dir")
+
+
+def _on_logs_dir_input_change() -> None:
+    _on_runtime_path_input_change("logs_dir")
+
+
+def _validate_runtime_paths_before_run() -> tuple[bool, dict[str, str]]:
+    normalized_paths: dict[str, str] = {}
+    for path_key in RUNTIME_PATH_KEYS:
+        is_valid, normalized_or_message = _validate_runtime_path(
+            st.session_state.get(path_key),
+            check_writable=True,
+        )
+        if not is_valid:
+            _push_runtime_path_warning()
+            return False, {}
+        normalized_paths[path_key] = normalized_or_message
+
+    for path_key, normalized in normalized_paths.items():
+        st.session_state[path_key] = normalized
+        st.session_state[f"_runtime_valid_{path_key}"] = normalized
+
+    return True, normalized_paths
 
 
 def _app_base_dir() -> Path:
@@ -105,6 +256,64 @@ def _exc_text(exc: Exception) -> str:
 
 def _now_run_id() -> str:
     return dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def _runtime_settings_path(base_dir: Path) -> Path:
+    return (base_dir / RUNTIME_SETTINGS_RELATIVE_PATH).resolve()
+
+
+def _load_runtime_settings(base_dir: Path) -> dict[str, str]:
+    settings_path = _runtime_settings_path(base_dir)
+    if not settings_path.exists():
+        return {}
+    try:
+        parsed = json.loads(settings_path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+
+    out: dict[str, str] = {}
+    for key in ("browser", "output_dir", "downloads_dir", "logs_dir"):
+        value = _safe_text(parsed.get(key))
+        if value:
+            out[key] = value
+    return out
+
+
+def _runtime_settings_payload(base_dir: Path) -> dict[str, str]:
+    _ = base_dir
+    defaults = _default_runtime_settings()
+    browser = _safe_text(st.session_state.get("browser")).lower() or defaults["browser"]
+    if browser not in {"msedge", "chrome", "auto", "chromium"}:
+        browser = defaults["browser"]
+    return {
+        "browser": browser,
+        "output_dir": _safe_text(st.session_state.get("output_dir")) or defaults["output_dir"],
+        "downloads_dir": _safe_text(st.session_state.get("downloads_dir")) or defaults["downloads_dir"],
+        "logs_dir": _safe_text(st.session_state.get("logs_dir")) or defaults["logs_dir"],
+    }
+
+
+def _persist_runtime_settings(*, force: bool = False) -> None:
+    base_dir = _app_base_dir().resolve()
+    settings_path = _runtime_settings_path(base_dir)
+    payload = _runtime_settings_payload(base_dir)
+    serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    if (not force) and (_safe_text(st.session_state.get("_runtime_settings_last_saved")) == serialized):
+        return
+
+    try:
+        settings_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = settings_path.with_suffix(settings_path.suffix + ".tmp")
+        temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        temp_path.replace(settings_path)
+        st.session_state["_runtime_settings_last_saved"] = serialized
+        st.session_state["_runtime_settings_needs_heal"] = False
+    except Exception:  # noqa: BLE001
+        # 설정 저장 실패는 실행을 막지 않는다.
+        st.session_state["_runtime_settings_needs_heal"] = True
+        return
 
 
 def _inject_ui_css() -> None:
@@ -161,6 +370,8 @@ def _inject_ui_css() -> None:
 
 def _init_session_state() -> None:
     base_dir = _app_base_dir().resolve()
+    runtime_settings_raw = _load_runtime_settings(base_dir)
+    runtime_settings, has_invalid_runtime_settings = _sanitize_loaded_runtime_settings(runtime_settings_raw)
 
     if "execution_store" not in st.session_state:
         st.session_state["execution_store"] = create_execution_store()
@@ -177,9 +388,20 @@ def _init_session_state() -> None:
     st.session_state.setdefault("run_downloads_dir", "")
     st.session_state.setdefault("run_logs_dir", "")
     st.session_state.setdefault("run_date_folder", "")
+    st.session_state.setdefault("_runtime_settings_needs_heal", False)
+    st.session_state.setdefault("_runtime_path_error", "")
+    if has_invalid_runtime_settings:
+        st.session_state["_runtime_settings_needs_heal"] = True
+        st.session_state["_runtime_path_error"] = INVALID_RUNTIME_PATH_MESSAGE
 
     st.session_state.setdefault("env_file", ".env")
-    st.session_state.setdefault("browser", _safe_text(os.getenv("GOOGLE_ADS_BROWSER", "msedge")).lower() or "msedge")
+    st.session_state.setdefault(
+        "browser",
+        runtime_settings.get("browser") or _safe_text(os.getenv("GOOGLE_ADS_BROWSER", "msedge")).lower() or "msedge",
+    )
+    if _safe_text(st.session_state.get("browser")).lower() not in {"msedge", "chrome", "auto", "chromium"}:
+        st.session_state["browser"] = runtime_settings["browser"]
+        st.session_state["_runtime_settings_needs_heal"] = True
     st.session_state.setdefault(
         "target_map_path",
         _safe_text(os.getenv("GOOGLE_ADS_TARGET_MAP", str(_default_target_map_path()))),
@@ -194,15 +416,38 @@ def _init_session_state() -> None:
     )
     st.session_state.setdefault(
         "downloads_dir",
-        _safe_text(os.getenv("GOOGLE_ADS_OUTPUT_DIR", str(base_dir / "downloads"))),
+        runtime_settings.get("downloads_dir")
+        or _safe_text(os.getenv("GOOGLE_ADS_OUTPUT_DIR", str(DEFAULT_USER_DOWNLOADS_DIR))),
     )
     st.session_state.setdefault(
         "output_dir",
-        str(base_dir / "output"),
+        runtime_settings.get("output_dir") or str(DEFAULT_USER_OUTPUT_DIR),
     )
     st.session_state.setdefault(
         "logs_dir",
-        _safe_text(os.getenv("GOOGLE_ADS_LOGS_DIR", str(base_dir / "logs"))),
+        runtime_settings.get("logs_dir")
+        or _safe_text(os.getenv("GOOGLE_ADS_LOGS_DIR", str(DEFAULT_USER_LOGS_DIR))),
+    )
+
+    for path_key in RUNTIME_PATH_KEYS:
+        is_valid, normalized_or_message = _validate_runtime_path(
+            st.session_state.get(path_key),
+            check_writable=False,
+        )
+        if not is_valid:
+            normalized = runtime_settings[path_key]
+            st.session_state["_runtime_settings_needs_heal"] = True
+            st.session_state["_runtime_path_error"] = INVALID_RUNTIME_PATH_MESSAGE
+        else:
+            normalized = normalized_or_message
+        st.session_state[path_key] = normalized
+        st.session_state[f"_runtime_valid_{path_key}"] = normalized
+        input_key = RUNTIME_INPUT_KEY_BY_PATH_KEY[path_key]
+        st.session_state.setdefault(input_key, normalized)
+
+    st.session_state.setdefault(
+        "_runtime_settings_last_saved",
+        json.dumps(_runtime_settings_payload(base_dir), ensure_ascii=False, sort_keys=True),
     )
 
 
@@ -218,17 +463,20 @@ def _render_sidebar_execution_section(snapshot: dict[str, Any]) -> None:
             options=browser_options,
             index=browser_options.index(current_browser),
         )
-        st.session_state["output_dir"] = st.text_input(
+        st.text_input(
             "결과 저장 경로",
-            value=_safe_text(st.session_state.get("output_dir")),
+            key=RUNTIME_INPUT_KEY_BY_PATH_KEY["output_dir"],
+            on_change=_on_output_dir_input_change,
         )
-        st.session_state["downloads_dir"] = st.text_input(
+        st.text_input(
             "다운로드 경로",
-            value=_safe_text(st.session_state.get("downloads_dir")),
+            key=RUNTIME_INPUT_KEY_BY_PATH_KEY["downloads_dir"],
+            on_change=_on_downloads_dir_input_change,
         )
-        st.session_state["logs_dir"] = st.text_input(
+        st.text_input(
             "로그 경로",
-            value=_safe_text(st.session_state.get("logs_dir")),
+            key=RUNTIME_INPUT_KEY_BY_PATH_KEY["logs_dir"],
+            on_change=_on_logs_dir_input_change,
         )
         if bool(snapshot.get("is_running")):
             st.info("실행 중입니다...")
@@ -346,6 +594,16 @@ def _selected_accounts() -> list[AdsAccount]:
 def _handle_start() -> None:
     store = st.session_state["execution_store"]
     if store.is_running():
+        return
+
+    paths_valid, _ = _validate_runtime_paths_before_run()
+    if not paths_valid:
+        store.push_event(
+            {
+                "type": "run_warning",
+                "message": INVALID_RUNTIME_PATH_MESSAGE,
+            }
+        )
         return
 
     run_dirs = _prepare_run_directories()
@@ -504,6 +762,16 @@ def _handle_start_export() -> None:
 
     selected_accounts = _selected_accounts()
     if not selected_accounts:
+        return
+
+    paths_valid, _ = _validate_runtime_paths_before_run()
+    if not paths_valid:
+        store.push_event(
+            {
+                "type": "run_warning",
+                "message": INVALID_RUNTIME_PATH_MESSAGE,
+            }
+        )
         return
 
     run_dirs = _prepare_run_directories()
