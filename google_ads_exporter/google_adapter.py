@@ -41,8 +41,12 @@ def _emit(progress_cb: ProgressCallback | None, payload: dict[str, Any]) -> None
         progress_cb(payload)
 
 
-def _row_id(*, cid_digits: str, target_key: str) -> str:
-    return f"{str(cid_digits or '').strip()}::{str(target_key or '').strip()}"
+def _row_id(*, cid_digits: str, activity_key: str, target_key: str) -> str:
+    return (
+        f"{str(cid_digits or '').strip()}::"
+        f"{str(activity_key or '').strip()}::"
+        f"{str(target_key or '').strip()}"
+    )
 
 
 def _exc_text(exc: Exception) -> str:
@@ -106,6 +110,8 @@ def _saved_report_to_dict(item: SavedReportItem) -> dict[str, Any]:
         "visible_name": item.visible_name,
         "normalized_name": item.normalized_name,
         "inferred_type": item.inferred_type,
+        "activity_name": item.activity_name or "",
+        "activity_key": item.activity_key or "",
         "row_text": item.row_text,
         "matched_key": item.matched_key,
         "owner_text": item.owner_text,
@@ -123,6 +129,8 @@ def _saved_report_from_dict(payload: dict[str, Any]) -> SavedReportItem:
         visible_name=str(payload.get("visible_name") or ""),
         normalized_name=str(payload.get("normalized_name") or ""),
         inferred_type=str(payload.get("inferred_type") or "unknown"),
+        activity_name=str(payload.get("activity_name") or "") or None,
+        activity_key=str(payload.get("activity_key") or "") or None,
         row_text=str(payload.get("row_text") or ""),
         matched_key=payload.get("matched_key"),
         owner_text=payload.get("owner_text"),
@@ -140,15 +148,21 @@ def _serialize_scan_results(scan_results: dict[str, dict[str, Any]]) -> dict[str
     for cid_digits, item in scan_results.items():
         account_obj = item.get("account")
         account_payload = _account_to_dict(account_obj) if isinstance(account_obj, AdsAccount) else {}
-        matched_map = item.get("matched_map", {})
-        matched_payload: dict[str, dict[str, Any]] = {}
-        if isinstance(matched_map, dict):
-            for target_key, report_item in matched_map.items():
-                if isinstance(report_item, SavedReportItem):
-                    matched_payload[str(target_key)] = _saved_report_to_dict(report_item)
+        matched_map_by_activity = item.get("matched_map_by_activity", {})
+        matched_payload_by_activity: dict[str, dict[str, dict[str, Any]]] = {}
+        if isinstance(matched_map_by_activity, dict):
+            for activity_key, matched_map in matched_map_by_activity.items():
+                if not isinstance(matched_map, dict):
+                    continue
+                activity_payload: dict[str, dict[str, Any]] = {}
+                for target_key, report_item in matched_map.items():
+                    if isinstance(report_item, SavedReportItem):
+                        activity_payload[str(target_key)] = _saved_report_to_dict(report_item)
+                if activity_payload:
+                    matched_payload_by_activity[str(activity_key)] = activity_payload
         payload[str(cid_digits)] = {
             "account": account_payload,
-            "matched_map": matched_payload,
+            "matched_map_by_activity": matched_payload_by_activity,
             "error": str(item.get("error") or ""),
         }
     return payload
@@ -158,17 +172,23 @@ def _deserialize_scan_results(payload: dict[str, dict[str, Any]]) -> dict[str, d
     results: dict[str, dict[str, Any]] = {}
     for cid_digits, item in payload.items():
         account_payload = item.get("account", {})
-        matched_payload = item.get("matched_map", {})
-        matched_map: dict[str, SavedReportItem] = {}
-        if isinstance(matched_payload, dict):
-            for target_key, report_data in matched_payload.items():
-                if isinstance(report_data, dict):
-                    matched_map[str(target_key)] = _saved_report_from_dict(report_data)
+        matched_payload_by_activity = item.get("matched_map_by_activity", {})
+        matched_map_by_activity: dict[str, dict[str, SavedReportItem]] = {}
+        if isinstance(matched_payload_by_activity, dict):
+            for activity_key, matched_payload in matched_payload_by_activity.items():
+                if not isinstance(matched_payload, dict):
+                    continue
+                matched_map: dict[str, SavedReportItem] = {}
+                for target_key, report_data in matched_payload.items():
+                    if isinstance(report_data, dict):
+                        matched_map[str(target_key)] = _saved_report_from_dict(report_data)
+                if matched_map:
+                    matched_map_by_activity[str(activity_key)] = matched_map
         account = _account_from_dict(account_payload) if isinstance(account_payload, dict) else AdsAccount("", "", "")
         results[str(cid_digits)] = {
             "account": account,
-            "items": list(matched_map.values()),
-            "matched_map": matched_map,
+            "items": [item for activity_map in matched_map_by_activity.values() for item in activity_map.values()],
+            "matched_map_by_activity": matched_map_by_activity,
             "error": str(item.get("error") or ""),
         }
     return results
@@ -180,28 +200,56 @@ def _scan_results_as_rows(scan_results: dict[str, dict[str, Any]]) -> list[dict[
         account = item.get("account")
         account_name = account.name if isinstance(account, AdsAccount) else "-"
         account_cid = account.cid if isinstance(account, AdsAccount) else "-"
-        matched_map = item.get("matched_map", {})
-        if not isinstance(matched_map, dict):
-            matched_map = {}
-        for target_key in TARGET_ORDER:
-            report_item = matched_map.get(target_key)
-            rows.append(
-                {
-                    "account": account_name,
-                    "cid": account_cid,
-                    "target_key": target_key,
-                    "target_display": TARGET_DISPLAY_NAMES.get(target_key, target_key),
-                    "matched_report": report_item.visible_name if isinstance(report_item, SavedReportItem) else "-",
-                    "owner": report_item.owner_text if isinstance(report_item, SavedReportItem) and report_item.owner_text else "-",
-                    "creation_date": report_item.creation_date
-                    if isinstance(report_item, SavedReportItem) and report_item.creation_date
-                    else "-",
-                    "date_range": report_item.date_range if isinstance(report_item, SavedReportItem) and report_item.date_range else "-",
-                    "created_by": report_item.created_by if isinstance(report_item, SavedReportItem) and report_item.created_by else "-",
-                    "status": "matched" if isinstance(report_item, SavedReportItem) else "not found",
-                }
-            )
+        matched_map_by_activity = item.get("matched_map_by_activity", {})
+        if not isinstance(matched_map_by_activity, dict):
+            matched_map_by_activity = {}
+        for activity_key in sorted(matched_map_by_activity.keys()):
+            matched_map = matched_map_by_activity.get(activity_key, {})
+            if not isinstance(matched_map, dict):
+                continue
+            activity_name = _resolve_activity_name(activity_key=activity_key, matched_map=matched_map)
+            for target_key in TARGET_ORDER:
+                report_item = matched_map.get(target_key)
+                rows.append(
+                    {
+                        "account": account_name,
+                        "cid": account_cid,
+                        "activity": activity_name,
+                        "activity_key": activity_key,
+                        "target_key": target_key,
+                        "target_display": TARGET_DISPLAY_NAMES.get(target_key, target_key),
+                        "matched_report": report_item.visible_name if isinstance(report_item, SavedReportItem) else "-",
+                        "owner": (
+                            report_item.owner_text
+                            if isinstance(report_item, SavedReportItem) and report_item.owner_text
+                            else "-"
+                        ),
+                        "creation_date": (
+                            report_item.creation_date
+                            if isinstance(report_item, SavedReportItem) and report_item.creation_date
+                            else "-"
+                        ),
+                        "date_range": (
+                            report_item.date_range
+                            if isinstance(report_item, SavedReportItem) and report_item.date_range
+                            else "-"
+                        ),
+                        "created_by": (
+                            report_item.created_by
+                            if isinstance(report_item, SavedReportItem) and report_item.created_by
+                            else "-"
+                        ),
+                        "status": "matched" if isinstance(report_item, SavedReportItem) else "not found",
+                    }
+                )
     return rows
+
+
+def _resolve_activity_name(*, activity_key: str, matched_map: dict[str, SavedReportItem]) -> str:
+    for report_item in matched_map.values():
+        if isinstance(report_item, SavedReportItem) and report_item.activity_name:
+            return str(report_item.activity_name)
+    return activity_key
 
 
 def _ensure_playwright_event_loop_policy(logger=None) -> None:
@@ -645,66 +693,87 @@ def scan_selected_accounts(
             for selected in selected_accounts:
                 account = discovered_by_cid.get(selected.cid_digits, selected)
                 _minimize_browser_page(page, logger=logger)
-                for target_key in TARGET_ORDER:
-                    _emit(
-                        progress_cb,
-                        {
-                            "type": "row_update",
-                            "row_id": _row_id(cid_digits=account.cid_digits, target_key=target_key),
-                            "status": "Scanning",
-                            "message": "scanning",
-                        },
-                    )
+                _emit(
+                    progress_cb,
+                    {
+                        "type": "account_stage",
+                        "account": account.name,
+                        "cid": account.cid,
+                        "activity": "-",
+                        "stage": "매칭",
+                        "status": "Exporting",
+                        "message": "액티비티 매칭 진행중",
+                    },
+                )
 
                 try:
-                    items, matched_map = scan_account_saved_reports(
+                    items, matched_map_by_activity = scan_account_saved_reports(
                         page=page,
                         account=account,
                         logger=logger,
                     )
-                    for target_key in TARGET_ORDER:
-                        item = matched_map.get(target_key)
-                        if item:
+                    for activity_key in sorted(matched_map_by_activity.keys()):
+                        matched_map = matched_map_by_activity.get(activity_key, {})
+                        if not isinstance(matched_map, dict):
+                            continue
+                        activity_name = _resolve_activity_name(activity_key=activity_key, matched_map=matched_map)
+                        for target_key in TARGET_ORDER:
+                            row_item = matched_map.get(target_key)
                             _emit(
                                 progress_cb,
                                 {
                                     "type": "row_update",
-                                    "row_id": _row_id(cid_digits=account.cid_digits, target_key=target_key),
-                                    "status": "Matched",
-                                    "message": item.visible_name,
+                                    "row_id": _row_id(
+                                        cid_digits=account.cid_digits,
+                                        activity_key=activity_key,
+                                        target_key=target_key,
+                                    ),
+                                    "account": account.name,
+                                    "cid": account.cid,
+                                    "activity": activity_name,
+                                    "activity_key": activity_key,
+                                    "target_key": target_key,
+                                    "target_display": TARGET_DISPLAY_NAMES.get(target_key, target_key),
+                                    "status": "Matched" if row_item else "Not Found",
+                                    "message": row_item.visible_name if row_item else "report not found",
                                 },
                             )
-                        else:
-                            _emit(
-                                progress_cb,
-                                {
-                                    "type": "row_update",
-                                    "row_id": _row_id(cid_digits=account.cid_digits, target_key=target_key),
-                                    "status": "Not Found",
-                                    "message": "report not found",
-                                },
-                            )
+
+                    _emit(
+                        progress_cb,
+                        {
+                            "type": "account_stage",
+                            "account": account.name,
+                            "cid": account.cid,
+                            "activity": "-",
+                            "stage": "매칭",
+                            "status": "Completed",
+                            "message": f"매칭 완료: {len(matched_map_by_activity)} activities",
+                        },
+                    )
                     results[account.cid_digits] = {
                         "account": account,
                         "items": items,
-                        "matched_map": matched_map,
+                        "matched_map_by_activity": matched_map_by_activity,
                     }
                 except Exception as exc:  # noqa: BLE001
                     error_text = _exc_text(exc)
-                    for target_key in TARGET_ORDER:
-                        _emit(
-                            progress_cb,
-                            {
-                                "type": "row_update",
-                                "row_id": _row_id(cid_digits=account.cid_digits, target_key=target_key),
-                                "status": "Failed",
-                                "message": error_text,
-                            },
-                        )
+                    _emit(
+                        progress_cb,
+                        {
+                            "type": "account_stage",
+                            "account": account.name,
+                            "cid": account.cid,
+                            "activity": "-",
+                            "stage": "매칭",
+                            "status": "Failed",
+                            "message": error_text,
+                        },
+                    )
                     results[account.cid_digits] = {
                         "account": account,
                         "items": [],
-                        "matched_map": {},
+                        "matched_map_by_activity": {},
                         "error": error_text,
                     }
         finally:
@@ -800,131 +869,224 @@ def run_google_export_for_accounts(
                 discovered_by_cid = {account.cid_digits: account for account in discovered_now}
 
                 outputs_count = 0
-                skipped_accounts = 0
+                skipped_activities = 0
                 total_targets = len(TARGET_ORDER)
                 for selected in selected_accounts:
                     account = discovered_by_cid.get(selected.cid_digits, selected)
                     account_label = f"{account.name} | {account.cid}"
                     _minimize_browser_page(page, logger=logger)
-                    matched_map: dict[str, SavedReportItem] = (
-                        scan_results.get(selected.cid_digits, {}).get("matched_map", {})
+                    matched_map_by_activity: dict[str, dict[str, SavedReportItem]] = (
+                        scan_results.get(selected.cid_digits, {}).get("matched_map_by_activity", {})
                     )
-                    if not matched_map:
-                        matched_map = scan_results.get(account.cid_digits, {}).get("matched_map", {})
+                    if not matched_map_by_activity:
+                        matched_map_by_activity = scan_results.get(account.cid_digits, {}).get(
+                            "matched_map_by_activity",
+                            {},
+                        )
 
-                    try:
-                        ensure_account_report_editor_ready(page=page, account=account, logger=logger)
-                        _minimize_browser_page(page, logger=logger)
+                    if not matched_map_by_activity:
                         _emit(
                             progress_cb,
                             {
                                 "type": "account_stage",
                                 "account": account.name,
                                 "cid": account.cid,
-                                "stage": "다운로드",
-                                "status": "Exporting",
-                                "message": "다운로드 진행중",
+                                "activity": "-",
+                                "stage": "매칭",
+                                "status": "Failed",
+                                "message": "activity match not found",
                             },
                         )
+                        continue
 
-                        def _download_progress(
-                            progress_account: AdsAccount,
-                            target_key: str,
-                            status: str,
-                            detail: str | None,
-                        ) -> None:
-                            normalized = str(status or "").strip().replace("_", " ").title()
-                            _emit(
-                                progress_cb,
-                                {
-                                    "type": "row_update",
-                                    "row_id": _row_id(
-                                        cid_digits=progress_account.cid_digits,
-                                        target_key=target_key,
-                                    ),
-                                    "status": normalized,
-                                    "message": str(detail or ""),
-                                },
-                            )
+                    try:
+                        ensure_account_report_editor_ready(page=page, account=account, logger=logger)
+                        _minimize_browser_page(page, logger=logger)
 
-                        download_results = _download_targets_for_account(
-                            page=page,
-                            account=account,
-                            matched_map=matched_map,
-                            logger=logger,
-                            progress_callback=_download_progress,
-                        )
-                        result_by_target: dict[str, DownloadResult] = {
-                            result.target_key: result for result in download_results
-                        }
-                        failed_retry_targets = [
-                            result.target_key
-                            for result in download_results
-                            if (not result.success) and (result.target_key in matched_map)
-                        ]
-                        successful_downloads = sum(
-                            1 for result in result_by_target.values() if result.success and result.filename
-                        )
-                        if failed_retry_targets:
-                            _minimize_browser_page(page, logger=logger)
+                        for activity_key in sorted(matched_map_by_activity.keys()):
+                            matched_map = matched_map_by_activity.get(activity_key, {})
+                            if not isinstance(matched_map, dict):
+                                continue
+                            activity_name = _resolve_activity_name(activity_key=activity_key, matched_map=matched_map)
                             _emit(
                                 progress_cb,
                                 {
                                     "type": "account_stage",
                                     "account": account.name,
                                     "cid": account.cid,
+                                    "activity": activity_name,
+                                    "activity_key": activity_key,
                                     "stage": "다운로드",
                                     "status": "Exporting",
-                                    "message": (
-                                        f"{successful_downloads}/{total_targets} 다운로드 완료, "
-                                        f"실패 {len(failed_retry_targets)}개 재시도 중(1/1)"
-                                    ),
+                                    "message": "다운로드 진행중",
                                 },
                             )
-                            retry_results = _download_targets_for_account(
+
+                            def _download_progress(
+                                progress_account: AdsAccount,
+                                target_key: str,
+                                status: str,
+                                detail: str | None,
+                                *,
+                                _activity_name: str = activity_name,
+                                _activity_key: str = activity_key,
+                            ) -> None:
+                                normalized = str(status or "").strip().replace("_", " ").title()
+                                _emit(
+                                    progress_cb,
+                                    {
+                                        "type": "row_update",
+                                        "row_id": _row_id(
+                                            cid_digits=progress_account.cid_digits,
+                                            activity_key=_activity_key,
+                                            target_key=target_key,
+                                        ),
+                                        "account": progress_account.name,
+                                        "cid": progress_account.cid,
+                                        "activity": _activity_name,
+                                        "activity_key": _activity_key,
+                                        "target_key": target_key,
+                                        "target_display": TARGET_DISPLAY_NAMES.get(target_key, target_key),
+                                        "status": normalized,
+                                        "message": str(detail or ""),
+                                    },
+                                )
+
+                            download_results = _download_targets_for_account(
                                 page=page,
                                 account=account,
                                 matched_map=matched_map,
                                 logger=logger,
                                 progress_callback=_download_progress,
-                                target_keys=set(failed_retry_targets),
+                                activity_name=activity_name,
+                                activity_key=activity_key,
                             )
-                            for retry_result in retry_results:
-                                result_by_target[retry_result.target_key] = retry_result
-
-                        download_results = [
-                            result_by_target.get(
-                                target_key,
-                                DownloadResult(
-                                    target_key=target_key,
-                                    success=False,
-                                    reason="download result missing",
-                                ),
+                            result_by_target: dict[str, DownloadResult] = {
+                                result.target_key: result for result in download_results
+                            }
+                            failed_retry_targets = [
+                                result.target_key
+                                for result in download_results
+                                if (not result.success) and (result.target_key in matched_map)
+                            ]
+                            successful_downloads = sum(
+                                1 for result in result_by_target.values() if result.success and result.filename
                             )
-                            for target_key in TARGET_ORDER
-                        ]
-                        final_successful_downloads = sum(
-                            1 for result in download_results if result.success and result.filename
-                        )
-                        final_failed_results = [result for result in download_results if not result.success]
+                            if failed_retry_targets:
+                                _minimize_browser_page(page, logger=logger)
+                                _emit(
+                                    progress_cb,
+                                    {
+                                        "type": "account_stage",
+                                        "account": account.name,
+                                        "cid": account.cid,
+                                        "activity": activity_name,
+                                        "activity_key": activity_key,
+                                        "stage": "다운로드",
+                                        "status": "Exporting",
+                                        "message": (
+                                            f"{successful_downloads}/{total_targets} 다운로드 완료, "
+                                            f"실패 {len(failed_retry_targets)}개 재시도 중(1/1)"
+                                        ),
+                                    },
+                                )
+                                retry_results = _download_targets_for_account(
+                                    page=page,
+                                    account=account,
+                                    matched_map=matched_map,
+                                    logger=logger,
+                                    progress_callback=_download_progress,
+                                    target_keys=set(failed_retry_targets),
+                                    activity_name=activity_name,
+                                    activity_key=activity_key,
+                                )
+                                for retry_result in retry_results:
+                                    result_by_target[retry_result.target_key] = retry_result
 
-                        _emit(
-                            progress_cb,
-                            {
-                                "type": "account_stage",
-                                "account": account.name,
-                                "cid": account.cid,
-                                "stage": "다운로드",
-                                "status": "Completed" if not final_failed_results else "Failed",
-                                "message": f"{final_successful_downloads}/{total_targets} 다운로드 완료",
-                            },
-                        )
+                            download_results = [
+                                result_by_target.get(
+                                    target_key,
+                                    DownloadResult(
+                                        target_key=target_key,
+                                        success=False,
+                                        activity_name=activity_name,
+                                        activity_key=activity_key,
+                                        reason="download result missing",
+                                    ),
+                                )
+                                for target_key in TARGET_ORDER
+                            ]
+                            final_successful_downloads = sum(
+                                1 for result in download_results if result.success and result.filename
+                            )
+                            final_failed_results = [result for result in download_results if not result.success]
 
-                        if final_failed_results:
-                            skipped_accounts += 1
-                            failed_display_names = ", ".join(
-                                TARGET_DISPLAY_NAMES.get(result.target_key, result.target_key)
-                                for result in final_failed_results
+                            _emit(
+                                progress_cb,
+                                {
+                                    "type": "account_stage",
+                                    "account": account.name,
+                                    "cid": account.cid,
+                                    "activity": activity_name,
+                                    "activity_key": activity_key,
+                                    "stage": "다운로드",
+                                    "status": "Completed" if not final_failed_results else "Failed",
+                                    "message": f"{final_successful_downloads}/{total_targets} 다운로드 완료",
+                                },
+                            )
+
+                            if final_failed_results:
+                                skipped_activities += 1
+                                failed_display_names = ", ".join(
+                                    TARGET_DISPLAY_NAMES.get(result.target_key, result.target_key)
+                                    for result in final_failed_results
+                                )
+                                _emit(
+                                    progress_cb,
+                                    {
+                                        "type": "account_stage",
+                                        "account": account.name,
+                                        "cid": account.cid,
+                                        "activity": activity_name,
+                                        "activity_key": activity_key,
+                                        "stage": "통합본",
+                                        "status": "Failed",
+                                        "message": (
+                                            f"통합본 생성 스킵 "
+                                            f"({len(final_failed_results)}/{total_targets} 실패: {failed_display_names})"
+                                        ),
+                                    },
+                                )
+                                if logger:
+                                    logger.warning(
+                                        "skip unified workbook due to failed targets | account=%s(%s) | activity=%s | failed=%s",
+                                        account.name,
+                                        account.cid,
+                                        activity_name,
+                                        [result.target_key for result in final_failed_results],
+                                    )
+                                continue
+
+                            _emit(
+                                progress_cb,
+                                {
+                                    "type": "account_stage",
+                                    "account": account.name,
+                                    "cid": account.cid,
+                                    "activity": activity_name,
+                                    "activity_key": activity_key,
+                                    "stage": "통합본",
+                                    "status": "Exporting",
+                                    "message": "통합본 생성중",
+                                },
+                            )
+                            output_path, summaries = create_unified_workbook_for_account(
+                                account=account,
+                                download_results=download_results,
+                                activity_name=activity_name,
+                                output_dir=final_output_dir,
+                                csv_dir=downloads_dir,
+                                logger=logger,
                             )
                             _emit(
                                 progress_cb,
@@ -932,88 +1094,63 @@ def run_google_export_for_accounts(
                                     "type": "account_stage",
                                     "account": account.name,
                                     "cid": account.cid,
+                                    "activity": activity_name,
+                                    "activity_key": activity_key,
                                     "stage": "통합본",
-                                    "status": "Failed",
-                                    "message": (
-                                        f"통합본 생성 스킵 "
-                                        f"({len(final_failed_results)}/{total_targets} 실패: {failed_display_names})"
-                                    ),
+                                    "status": "Completed",
+                                    "message": f"통합본 생성완료:{output_path.name}",
                                 },
                             )
                             if logger:
-                                logger.warning(
-                                    "skip unified workbook due to failed targets | account=%s(%s) | failed=%s",
+                                logger.info(
+                                    "unified workbook written | account=%s(%s) | activity=%s | path=%s",
                                     account.name,
                                     account.cid,
-                                    [result.target_key for result in final_failed_results],
+                                    activity_name,
+                                    output_path,
                                 )
-                            continue
-
-                        _emit(
-                            progress_cb,
-                            {
-                                "type": "account_stage",
-                                "account": account.name,
-                                "cid": account.cid,
-                                "stage": "통합본",
-                                "status": "Exporting",
-                                "message": "통합본 생성중",
-                            },
-                        )
-                        output_path, summaries = create_unified_workbook_for_account(
-                            account=account,
-                            download_results=download_results,
-                            output_dir=final_output_dir,
-                            csv_dir=downloads_dir,
-                            logger=logger,
-                        )
-                        _emit(
-                            progress_cb,
-                            {
-                                "type": "account_stage",
-                                "account": account.name,
-                                "cid": account.cid,
-                                "stage": "통합본",
-                                "status": "Completed",
-                                "message": f"통합본 생성완료:{output_path.name}",
-                            },
-                        )
-                        if logger:
-                            logger.info(
-                                "unified workbook written | account=%s(%s) | path=%s",
-                                account.name,
-                                account.cid,
-                                output_path,
+                            outputs_count += 1
+                            summary_rows = summaries_as_rows(
+                                summaries,
+                                account_label,
+                                activity_name=activity_name,
                             )
-                        outputs_count += 1
-                        summary_rows = summaries_as_rows(summaries, account_label)
-                        _emit(
-                            progress_cb,
-                            {
-                                "type": "account_result",
-                                "account": account.name,
-                                "cid": account.cid,
-                                "workbook_path": str(output_path),
-                                "summaries": summary_rows,
-                            },
-                        )
-                        for summary in summaries:
                             _emit(
                                 progress_cb,
                                 {
-                                    "type": "row_update",
-                                    "row_id": _row_id(
-                                        cid_digits=account.cid_digits,
-                                        target_key=summary.target_key,
-                                    ),
-                                    "status": "Completed" if summary.status == "excel_written" else "Failed",
-                                    "message": (
-                                        f"{summary.written_rows}/{summary.csv_rows} rows"
-                                        if summary.status == "excel_written"
-                                        else (summary.reason or "failed")
-                                    ),
+                                    "type": "account_result",
+                                    "account": account.name,
+                                    "cid": account.cid,
+                                    "activity": activity_name,
+                                    "activity_key": activity_key,
+                                    "workbook_path": str(output_path),
+                                    "summaries": summary_rows,
                                 },
                             )
+                            for summary in summaries:
+                                _emit(
+                                    progress_cb,
+                                    {
+                                        "type": "row_update",
+                                        "row_id": _row_id(
+                                            cid_digits=account.cid_digits,
+                                            activity_key=activity_key,
+                                            target_key=summary.target_key,
+                                        ),
+                                        "account": account.name,
+                                        "cid": account.cid,
+                                        "activity": activity_name,
+                                        "activity_key": activity_key,
+                                        "target_key": summary.target_key,
+                                        "target_display": TARGET_DISPLAY_NAMES.get(summary.target_key, summary.target_key),
+                                        "status": "Completed" if summary.status == "excel_written" else "Failed",
+                                        "message": (
+                                            f"{summary.written_rows}/{summary.csv_rows} rows"
+                                            if summary.status == "excel_written"
+                                            else (summary.reason or "failed")
+                                        ),
+                                    },
+                                )
                     except Exception as exc:  # noqa: BLE001
                         error_text = _exc_text(exc)
                         _emit(
@@ -1022,38 +1159,51 @@ def run_google_export_for_accounts(
                                 "type": "account_stage",
                                 "account": account.name,
                                 "cid": account.cid,
+                                "activity": "-",
                                 "stage": "통합본",
                                 "status": "Failed",
                                 "message": error_text,
                             },
                         )
-                        for target_key in TARGET_ORDER:
-                            _emit(
-                                progress_cb,
-                                {
-                                    "type": "row_update",
-                                    "row_id": _row_id(cid_digits=account.cid_digits, target_key=target_key),
-                                    "status": "Failed",
-                                    "message": error_text,
-                                },
-                            )
+                        for activity_key, matched_map in matched_map_by_activity.items():
+                            activity_name = _resolve_activity_name(activity_key=activity_key, matched_map=matched_map)
+                            for target_key in TARGET_ORDER:
+                                _emit(
+                                    progress_cb,
+                                    {
+                                        "type": "row_update",
+                                        "row_id": _row_id(
+                                            cid_digits=account.cid_digits,
+                                            activity_key=activity_key,
+                                            target_key=target_key,
+                                        ),
+                                        "account": account.name,
+                                        "cid": account.cid,
+                                        "activity": activity_name,
+                                        "activity_key": activity_key,
+                                        "target_key": target_key,
+                                        "target_display": TARGET_DISPLAY_NAMES.get(target_key, target_key),
+                                        "status": "Failed",
+                                        "message": error_text,
+                                    },
+                                )
 
                 _emit(
                     progress_cb,
                     {
                         "type": "run_completed",
-                        "run_status": "Completed (With Failures)" if skipped_accounts else "Completed",
+                        "run_status": "Completed (With Failures)" if skipped_activities else "Completed",
                         "message": (
                             f"Export completed. Workbook count={outputs_count}"
-                            + (f", skipped={skipped_accounts}" if skipped_accounts else "")
+                            + (f", skipped={skipped_activities}" if skipped_activities else "")
                         ),
                     },
                 )
                 if logger:
                     logger.info(
-                        "export completed | workbook_count=%s | skipped_accounts=%s",
+                        "export completed | workbook_count=%s | skipped_activities=%s",
                         outputs_count,
-                        skipped_accounts,
+                        skipped_activities,
                     )
             finally:
                 context.close()

@@ -10,8 +10,8 @@ from typing import Iterable
 
 
 DEFAULT_TARGET_PREFIXES: dict[str, list[str]] = {
-    "placements": ["bcg_placements"],
-    "demographics": ["bcg_demographics"],
+    "placements": ["bcg_auto_placements"],
+    "demographics": ["bcg_auto_demographics"],
     "campaign_ad_group": ["bcg_auto_campaignadgroup"],
     "adformat": ["bcg_auto_adformat"],
     "hourofday": ["bcg_auto_hourofday"],
