@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from .models import AdsAccount
-from .targets import TARGET_DISPLAY_NAMES, TARGET_ORDER
+from .targets import TARGET_DISPLAY_NAMES
 
 
 ProgressCallback = Callable[[dict[str, Any]], None]
@@ -20,14 +20,21 @@ def _now_text() -> str:
     return dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def _row_id(*, cid_digits: str, target_key: str) -> str:
-    return f"{str(cid_digits or '').strip()}::{str(target_key or '').strip()}"
+def _row_id(*, cid_digits: str, activity_key: str, target_key: str) -> str:
+    return (
+        f"{str(cid_digits or '').strip()}::"
+        f"{str(activity_key or '').strip()}::"
+        f"{str(target_key or '').strip()}"
+    )
 
 
 @dataclass(frozen=True, slots=True)
 class LogRow:
     row_id: str
     account: str
+    cid: str
+    activity: str
+    activity_key: str
     target_key: str
     target_display: str
     status: str
@@ -39,6 +46,8 @@ class LogRow:
 class AccountStageRow:
     account: str
     cid: str
+    activity: str
+    activity_key: str
     stage: str
     status: str
     message: str
@@ -81,20 +90,6 @@ class ExecutionStateStore:
             self._summaries = []
             self._scan_result_rows = []
             self.last_error = ""
-            for account in accounts:
-                account_label = f"{account.name} | {account.cid}"
-                for target_key in TARGET_ORDER:
-                    row = LogRow(
-                        row_id=_row_id(cid_digits=account.cid_digits, target_key=target_key),
-                        account=account_label,
-                        target_key=target_key,
-                        target_display=TARGET_DISPLAY_NAMES.get(target_key, target_key),
-                        status="Pending",
-                        message="waiting",
-                        last_updated=_now_text(),
-                    )
-                    self._rows[row.row_id] = row
-                    self._row_order.append(row.row_id)
 
     def start_thread(self, thread: threading.Thread) -> None:
         with self._lock:
@@ -112,19 +107,48 @@ class ExecutionStateStore:
         row_id: str,
         status: str,
         message: str,
+        account: str = "",
+        cid: str = "",
+        activity: str = "",
+        activity_key: str = "",
+        target_key: str = "",
+        target_display: str = "",
     ) -> None:
         existing = self._rows.get(row_id)
-        if not existing:
+        if existing:
+            self._rows[row_id] = LogRow(
+                row_id=existing.row_id,
+                account=account or existing.account,
+                cid=cid or existing.cid,
+                activity=activity or existing.activity,
+                activity_key=activity_key or existing.activity_key,
+                target_key=target_key or existing.target_key,
+                target_display=target_display or existing.target_display,
+                status=status,
+                message=message,
+                last_updated=_now_text(),
+            )
             return
-        self._rows[row_id] = LogRow(
-            row_id=existing.row_id,
-            account=existing.account,
-            target_key=existing.target_key,
-            target_display=existing.target_display,
+
+        effective_target_key = str(target_key or "").strip()
+        effective_target_display = (
+            str(target_display or "").strip()
+            or TARGET_DISPLAY_NAMES.get(effective_target_key, effective_target_key or "-")
+        )
+        row = LogRow(
+            row_id=row_id,
+            account=str(account or "-").strip(),
+            cid=str(cid or "-").strip(),
+            activity=str(activity or "-").strip(),
+            activity_key=str(activity_key or "-").strip(),
+            target_key=effective_target_key or "-",
+            target_display=effective_target_display,
             status=status,
             message=message,
             last_updated=_now_text(),
         )
+        self._rows[row_id] = row
+        self._row_order.append(row_id)
 
     def drain_events(self) -> None:
         while True:
@@ -168,16 +192,26 @@ class ExecutionStateStore:
                         row_id=str(event.get("row_id") or ""),
                         status=str(event.get("status") or "Running"),
                         message=str(event.get("message") or ""),
+                        account=str(event.get("account") or ""),
+                        cid=str(event.get("cid") or ""),
+                        activity=str(event.get("activity") or ""),
+                        activity_key=str(event.get("activity_key") or ""),
+                        target_key=str(event.get("target_key") or ""),
+                        target_display=str(event.get("target_display") or ""),
                     )
                 elif event_type == "account_result":
                     account = str(event.get("account") or "")
                     cid = str(event.get("cid") or "")
+                    activity = str(event.get("activity") or "")
+                    activity_key = str(event.get("activity_key") or "")
                     workbook_path = str(event.get("workbook_path") or "")
                     if workbook_path:
                         self._outputs.append(
                             {
                                 "account": account,
                                 "cid": cid,
+                                "activity": activity,
+                                "activity_key": activity_key,
                                 "workbook_path": workbook_path,
                             }
                         )
@@ -197,10 +231,14 @@ class ExecutionStateStore:
                 elif event_type == "account_stage":
                     account = str(event.get("account") or "")
                     cid = str(event.get("cid") or "")
-                    key = f"{account}|{cid}"
+                    activity = str(event.get("activity") or "-")
+                    activity_key = str(event.get("activity_key") or activity or "-")
+                    key = f"{account}|{cid}|{activity_key}"
                     self._account_stage_map[key] = AccountStageRow(
                         account=account,
                         cid=cid,
+                        activity=activity,
+                        activity_key=activity_key,
                         stage=str(event.get("stage") or ""),
                         status=str(event.get("status") or "Waiting"),
                         message=str(event.get("message") or ""),

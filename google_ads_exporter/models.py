@@ -19,6 +19,8 @@ class SavedReportItem:
     visible_name: str
     normalized_name: str
     inferred_type: str  # report / view / unknown
+    activity_name: str | None
+    activity_key: str | None
     row_text: str
     matched_key: str | None
     owner_text: str | None
@@ -34,5 +36,7 @@ class SavedReportItem:
 class DownloadResult:
     target_key: str
     success: bool
+    activity_name: str = ""
+    activity_key: str = ""
     filename: str | None = None
     reason: str | None = None

@@ -62,10 +62,12 @@ def show_download_results(results_by_account: dict[str, list[DownloadResult]]) -
     for account_label, results in results_by_account.items():
         lines.append(f"[{account_label}]")
         for result in results:
+            activity = str(result.activity_name or result.activity_key or "").strip()
+            prefix = f"[{activity}] " if activity else ""
             if result.success:
-                lines.append(f"{result.target_key:<18} SUCCESS  -> {result.filename}")
+                lines.append(f"{prefix}{result.target_key:<18} SUCCESS  -> {result.filename}")
             else:
-                lines.append(f"{result.target_key:<18} FAIL     -> {result.reason}")
+                lines.append(f"{prefix}{result.target_key:<18} FAIL     -> {result.reason}")
         lines.append("")
 
     if not lines:

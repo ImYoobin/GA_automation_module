@@ -28,6 +28,8 @@ def download_item(
     account: AdsAccount,
     item: SavedReportItem,
     output_dir: Path,
+    activity_name: str = "",
+    activity_key: str = "",
     logger=None,
 ) -> DownloadResult:
     is_report = _is_report_target(item)
@@ -41,14 +43,32 @@ def download_item(
             continue
 
         if is_report:
-            saved, reason = _try_report_download(page, row, account, item, output_dir, logger=logger)
+            saved, reason = _try_report_download(
+                page,
+                row,
+                account,
+                item,
+                output_dir,
+                activity_name=activity_name,
+                logger=logger,
+            )
         else:
-            saved, reason = _try_view_download(page, row, account, item, output_dir, logger=logger)
+            saved, reason = _try_view_download(
+                page,
+                row,
+                account,
+                item,
+                output_dir,
+                activity_name=activity_name,
+                logger=logger,
+            )
 
         if saved:
             return DownloadResult(
                 target_key=item.matched_key or "unknown",
                 success=True,
+                activity_name=activity_name,
+                activity_key=activity_key,
                 filename=saved.name,
             )
 
@@ -66,6 +86,8 @@ def download_item(
     return DownloadResult(
         target_key=item.matched_key or "unknown",
         success=False,
+        activity_name=activity_name,
+        activity_key=activity_key,
         reason=last_reason,
     )
 
@@ -76,6 +98,7 @@ def _try_view_download(
     account: AdsAccount,
     item: SavedReportItem,
     output_dir: Path,
+    activity_name: str = "",
     logger=None,
 ):
     """
@@ -120,7 +143,7 @@ def _try_view_download(
         try:
             with page.expect_download(timeout=DOWNLOAD_TIMEOUT_MS) as download_info:
                 control.click(timeout=5000)
-            saved = _save_download(download_info.value, output_dir, account, item)
+            saved = _save_download(download_info.value, output_dir, account, item, activity_name=activity_name)
             if logger:
                 logger.info(
                     "download success (%s) target=%s file=%s",
@@ -153,7 +176,7 @@ def _try_view_download(
         try:
             with page.expect_download(timeout=DOWNLOAD_TIMEOUT_MS) as download_info:
                 control.click(timeout=5000)
-            saved = _save_download(download_info.value, output_dir, account, item)
+            saved = _save_download(download_info.value, output_dir, account, item, activity_name=activity_name)
             if logger:
                 logger.info(
                     "download success (%s) target=%s file=%s",
@@ -184,6 +207,7 @@ def _try_report_download(
     account: AdsAccount,
     item: SavedReportItem,
     output_dir: Path,
+    activity_name: str = "",
     logger=None,
 ):
     """
@@ -208,7 +232,7 @@ def _try_report_download(
     try:
         with page.expect_download(timeout=DOWNLOAD_TIMEOUT_MS) as download_info:
             csv_item.click(timeout=5000)
-        saved = _save_download(download_info.value, output_dir, account, item)
+        saved = _save_download(download_info.value, output_dir, account, item, activity_name=activity_name)
         if logger:
             logger.info("download success (report-csv-menu) target=%s file=%s", item.matched_key, saved.name)
         return saved, None
@@ -342,8 +366,19 @@ def _looks_like_csv_text(text: str) -> bool:
     return normalized in {".csv", "csv"} or normalized.startswith(".csv") or normalized.endswith(".csv")
 
 
-def _save_download(download, output_dir: Path, account: AdsAccount, item: SavedReportItem) -> Path:
-    out_path = _build_output_path(output_dir, account, item.matched_key or "unknown")
+def _save_download(
+    download,
+    output_dir: Path,
+    account: AdsAccount,
+    item: SavedReportItem,
+    activity_name: str = "",
+) -> Path:
+    out_path = _build_output_path(
+        output_dir,
+        account,
+        target_key=item.matched_key or "unknown",
+        activity_name=activity_name,
+    )
     if out_path.exists():
         out_path.unlink()
     download.save_as(str(out_path))
@@ -426,9 +461,18 @@ def _as_row_container(locator):
     return locator
 
 
-def _build_output_path(output_dir: Path, account: AdsAccount, target_key: str) -> Path:
+def _build_output_path(
+    output_dir: Path,
+    account: AdsAccount,
+    target_key: str,
+    activity_name: str = "",
+) -> Path:
     run_date = datetime.now().strftime("%Y%m%d")
-    filename = f"{run_date}_{account.name}_{target_key}.csv"
+    activity_fragment = str(activity_name or "").strip()
+    if activity_fragment:
+        filename = f"{run_date}_{account.name}_{activity_fragment}_{target_key}.csv"
+    else:
+        filename = f"{run_date}_{account.name}_{target_key}.csv"
     return output_dir / sanitize_filename(filename)
 
 

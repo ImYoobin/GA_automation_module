@@ -29,7 +29,6 @@ from google_ads_exporter.google_adapter import (
 from google_ads_exporter.google_excel_builder import open_file_in_explorer
 from google_ads_exporter.main import _apply_runtime_directory_overrides, _default_target_map_path
 from google_ads_exporter.models import AdsAccount
-from google_ads_exporter.targets import TARGET_ORDER
 from google_ads_exporter.utils import setup_logger
 
 STATUS_LABEL = {
@@ -781,7 +780,7 @@ def _handle_start_export() -> None:
     )
     logger, log_path = setup_logger("google_ads_exporter.streamlit")
 
-    st.session_state["expected_output_count"] = len(selected_accounts)
+    st.session_state["expected_output_count"] = 0
     st.session_state["opened_output_for_run"] = ""
     st.session_state["validated_output_count_run"] = ""
     st.session_state["matching_ready"] = False
@@ -868,6 +867,8 @@ def _render_bottom_section(snapshot: dict[str, Any]) -> None:
             [
                 {
                     "account": row.account,
+                    "cid": row.cid,
+                    "activity": row.activity,
                     "target": row.target_display,
                     "status": _status_label_text(row.status),
                     "message": row.message,
@@ -879,6 +880,8 @@ def _render_bottom_section(snapshot: dict[str, Any]) -> None:
         ).rename(
             columns={
                 "account": "계정",
+                "cid": "CID",
+                "activity": "액티비티",
                 "target": "리포트",
                 "status": "상태",
                 "message": "메시지",
@@ -896,19 +899,14 @@ def _render_bottom_section(snapshot: dict[str, Any]) -> None:
     st.markdown("#### 통합본 생성 상태")
     account_stage_rows = snapshot.get("account_stage_rows") or []
     if account_stage_rows:
-        def _account_key(name: str, cid: str) -> str:
-            return f"{_safe_text(name)}|{_safe_text(cid)}"
+        def _account_key(name: str, cid: str, activity_key: str) -> str:
+            return f"{_safe_text(name)}|{_safe_text(cid)}|{_safe_text(activity_key)}"
 
         progress_map: dict[str, dict[str, int]] = {}
         for row in rows:
             if not isinstance(row, LogRow):
                 continue
-            account_name = _safe_text(row.account)
-            if "|" in account_name:
-                left, right = account_name.split("|", 1)
-                key = _account_key(left, right)
-            else:
-                key = _account_key(account_name, "")
+            key = _account_key(row.account, row.cid, row.activity_key)
             if key not in progress_map:
                 progress_map[key] = {"completed": 0, "total": 0}
             progress_map[key]["total"] += 1
@@ -920,10 +918,11 @@ def _render_bottom_section(snapshot: dict[str, Any]) -> None:
                 {
                     "account": row.account,
                     "cid": row.cid,
+                    "activity": row.activity,
                     "status": _status_label_text(row.status),
                     "processed_sheets": (
-                        f"{progress_map.get(_account_key(row.account, row.cid), {}).get('completed', 0)}/"
-                        f"{progress_map.get(_account_key(row.account, row.cid), {}).get('total', len(TARGET_ORDER))}"
+                        f"{progress_map.get(_account_key(row.account, row.cid, row.activity_key), {}).get('completed', 0)}/"
+                        f"{progress_map.get(_account_key(row.account, row.cid, row.activity_key), {}).get('total', 0)}"
                     ),
                     "message": row.message,
                     "updated_at": row.updated_at,
@@ -935,6 +934,7 @@ def _render_bottom_section(snapshot: dict[str, Any]) -> None:
             columns={
                 "account": "계정",
                 "cid": "CID",
+                "activity": "액티비티",
                 "status": "상태",
                 "processed_sheets": "처리 시트 수",
                 "message": "메시지",
@@ -961,8 +961,22 @@ def _validate_output_count(snapshot: dict[str, Any]) -> None:
         return
 
     expected = int(st.session_state.get("expected_output_count") or 0)
+    if expected <= 0:
+        scan_rows = snapshot.get("scan_result_rows") or []
+        unique_activity_keys: set[str] = set()
+        for row in scan_rows:
+            if not isinstance(row, dict):
+                continue
+            account = _safe_text(row.get("account"))
+            cid = _safe_text(row.get("cid"))
+            activity_key = _safe_text(row.get("activity_key"))
+            if account and cid and activity_key:
+                unique_activity_keys.add(f"{account}|{cid}|{activity_key}")
+        expected = len(unique_activity_keys)
+        st.session_state["expected_output_count"] = expected
+
     actual = len(snapshot.get("outputs") or [])
-    if expected > 0 and actual != expected:
+    if run_status == "Completed" and expected > 0 and actual != expected:
         st.session_state["execution_store"].push_event(
             {
                 "type": "run_warning",

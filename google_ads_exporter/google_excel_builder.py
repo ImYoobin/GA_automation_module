@@ -224,6 +224,7 @@ def create_unified_workbook_for_account(
     *,
     account: AdsAccount,
     download_results: list[DownloadResult],
+    activity_name: str = "",
     output_dir: Path,
     csv_dir: Path | None = None,
     logger=None,
@@ -252,8 +253,13 @@ def create_unified_workbook_for_account(
         summaries.append(summary)
 
     run_date = datetime.now().strftime("%Y%m%d")
+    activity_fragment = str(activity_name or "").strip()
+    if activity_fragment:
+        output_stem = f"{run_date}_{account.name}_{account.cid_digits}_{activity_fragment}_Google_Unified.xlsx"
+    else:
+        output_stem = f"{run_date}_{account.name}_{account.cid_digits}_Google_Unified.xlsx"
     output_name = sanitize_filename(
-        f"{run_date}_{account.name}_{account.cid_digits}_Google_Unified.xlsx"
+        output_stem
     )
     output_path = output_dir / output_name
     workbook.save(output_path)
@@ -278,12 +284,17 @@ def open_file_in_explorer(file_path: Path, logger=None) -> bool:
     return False
 
 
-def summaries_as_rows(summaries: list[CsvProcessSummary], account_label: str) -> list[dict[str, object]]:
+def summaries_as_rows(
+    summaries: list[CsvProcessSummary],
+    account_label: str,
+    activity_name: str = "",
+) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     for item in summaries:
         rows.append(
             {
                 "account": account_label,
+                "activity": activity_name,
                 "target_key": item.target_key,
                 "target_display": item.target_display,
                 "sheet_name": item.sheet_name,

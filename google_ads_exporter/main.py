@@ -27,7 +27,7 @@ from .report_editor import (
     open_report_editor,
 )
 from .result_ui import confirm_scan_results, show_download_results
-from .saved_reports_scanner import match_targets, scan_saved_reports
+from .saved_reports_scanner import match_targets_by_activity, scan_saved_reports
 from .targets import TARGET_ORDER, TargetMappingError, load_target_mapping_file
 from .utils import get_run_output_dir, setup_logger
 
@@ -204,14 +204,18 @@ def process_account(
     enable_download: bool,
     logger,
 ) -> list[DownloadResult] | None:
-    items, matched_map = scan_account_saved_reports(page=page, account=account, logger=logger)
+    items, matched_map_by_activity = scan_account_saved_reports(page=page, account=account, logger=logger)
+    first_activity_map: dict[str, SavedReportItem] = {}
+    if matched_map_by_activity:
+        first_activity_key = sorted(matched_map_by_activity.keys())[0]
+        first_activity_map = matched_map_by_activity.get(first_activity_key, {})
 
     action = confirm_scan_results(
         account,
         items,
         download_enabled=enable_download,
         scan_only_enabled=False,
-        matched_map=matched_map,
+        matched_map=first_activity_map,
     )
     logger.info(
         "scan confirmation action=%s account=%s (%s)",
@@ -225,7 +229,20 @@ def process_account(
         return []
 
     # proceed_download path
-    return _download_targets_for_account(page, account, matched_map, logger=logger)
+    all_results: list[DownloadResult] = []
+    for activity_key, matched_map in sorted(matched_map_by_activity.items()):
+        activity_name = _resolve_activity_name(activity_key=activity_key, matched_map=matched_map)
+        all_results.extend(
+            _download_targets_for_account(
+                page,
+                account,
+                matched_map,
+                logger=logger,
+                activity_name=activity_name,
+                activity_key=activity_key,
+            )
+        )
+    return all_results
 
 
 def ensure_account_report_editor_ready(page, account: AdsAccount, logger) -> None:
@@ -289,12 +306,12 @@ def scan_account_saved_reports(
     page,
     account: AdsAccount,
     logger,
-) -> tuple[list[SavedReportItem], dict[str, SavedReportItem]]:
+) -> tuple[list[SavedReportItem], dict[str, dict[str, SavedReportItem]]]:
     ensure_account_report_editor_ready(page=page, account=account, logger=logger)
     assert_session_active(page, logger=logger)
     items = _scan_saved_reports_with_retries(page, logger=logger)
-    matched_map = match_targets(items, logger=logger)
-    return items, matched_map
+    matched_map_by_activity = match_targets_by_activity(items, logger=logger)
+    return items, matched_map_by_activity
 
 
 def _scan_saved_reports_with_retries(page, logger) -> list[SavedReportItem]:
@@ -312,6 +329,13 @@ def _scan_saved_reports_with_retries(page, logger) -> list[SavedReportItem]:
     return []
 
 
+def _resolve_activity_name(*, activity_key: str, matched_map: dict[str, SavedReportItem]) -> str:
+    for item in matched_map.values():
+        if item.activity_name:
+            return item.activity_name
+    return activity_key
+
+
 def _download_targets_for_account(
     page,
     account: AdsAccount,
@@ -319,6 +343,8 @@ def _download_targets_for_account(
     logger,
     progress_callback: Callable[[AdsAccount, str, str, str | None], None] | None = None,
     target_keys: set[str] | None = None,
+    activity_name: str = "",
+    activity_key: str = "",
 ) -> list[DownloadResult]:
     output_dir = get_run_output_dir()
     if logger:
@@ -350,6 +376,8 @@ def _download_targets_for_account(
                 DownloadResult(
                     target_key=target_key,
                     success=False,
+                    activity_name=activity_name,
+                    activity_key=activity_key,
                     reason="report not found",
                 )
             )
@@ -357,7 +385,8 @@ def _download_targets_for_account(
 
         assert_session_active(page, logger=logger)
         logger.info(
-            "download target start | key=%s | name=%s | type=%s",
+            "download target start | activity=%s | key=%s | name=%s | type=%s",
+            activity_name or activity_key or "-",
             target_key,
             item.visible_name,
             item.inferred_type,
@@ -370,12 +399,22 @@ def _download_targets_for_account(
                 DownloadResult(
                     target_key=target_key,
                     success=False,
+                    activity_name=activity_name,
+                    activity_key=activity_key,
                     reason="report editor restore failed",
                 )
             )
             continue
 
-        result = download_item(page, account, item, output_dir, logger=logger)
+        result = download_item(
+            page,
+            account,
+            item,
+            output_dir,
+            activity_name=activity_name,
+            activity_key=activity_key,
+            logger=logger,
+        )
         results.append(result)
         logger.info(
             "download target result | key=%s | success=%s | reason=%s | filename=%s",

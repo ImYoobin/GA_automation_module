@@ -52,6 +52,39 @@ EMAIL_REGEX = re.compile(r"\b[^@\s]+@[^@\s]+\.[^@\s]+\b")
 CID_REGEX = re.compile(r"\b\d{3}-\d{3}-\d{4}\b")
 BCG_LINE_REGEX = re.compile(r"\bBCG[\w\s\-\(\),]*", re.IGNORECASE)
 ROW_COUNT_REGEX = re.compile(r"^(10|25|50|100|250|500|1000)$")
+ACTIVITY_WHITESPACE_REGEX = re.compile(r"\s+")
+
+
+def normalize_activity_key(activity_name: str) -> str:
+    lowered = normalize_report_name(activity_name or "")
+    compact = ACTIVITY_WHITESPACE_REGEX.sub("_", lowered)
+    return compact.strip("_")
+
+
+def extract_activity_name(visible_name: str, matched_key: str | None) -> str | None:
+    if not matched_key:
+        return None
+
+    name = str(visible_name or "").strip()
+    if not name:
+        return None
+    split_idx = name.rfind("_")
+    if split_idx <= 0 or split_idx >= len(name) - 1:
+        return None
+
+    base_name = name[:split_idx].strip()
+    activity_name = name[split_idx + 1 :].strip()
+    if not base_name or not activity_name:
+        return None
+
+    base_key, base_ambiguous = match_target_key(normalize_report_name(base_name))
+    if base_ambiguous or base_key != matched_key:
+        return None
+
+    activity_key = normalize_activity_key(activity_name)
+    if not activity_key:
+        return None
+    return activity_name
 
 
 def scan_saved_reports(page: Page, logger=None) -> list[SavedReportItem]:
@@ -377,7 +410,14 @@ def _scan_by_essfield_columns_once(scope, logger=None, scope_label: str = "root"
         )
 
         key, ambiguous = match_target_key(normalized_name)
-        matched_key = None if ambiguous else key
+        matched_key = None
+        activity_name = None
+        activity_key = None
+        if (not ambiguous) and key:
+            activity_name = extract_activity_name(visible_name, key)
+            if activity_name:
+                activity_key = normalize_activity_key(activity_name)
+                matched_key = key
         inferred_type = _infer_type(
             normalized_name=normalized_name,
             has_download_text=has_download_text,
@@ -419,6 +459,8 @@ def _scan_by_essfield_columns_once(scope, logger=None, scope_label: str = "root"
             visible_name=visible_name,
             normalized_name=normalized_name,
             inferred_type=inferred_type,
+            activity_name=activity_name,
+            activity_key=activity_key,
             row_text=row_text,
             matched_key=matched_key,
             owner_text=owner_text,
@@ -432,11 +474,12 @@ def _scan_by_essfield_columns_once(scope, logger=None, scope_label: str = "root"
         items.append(item)
         if logger:
             logger.info(
-                "essfield row=%s | name=%s | type=%s | matched_key=%s | owner=%s | creation=%s | date_range=%s | created_by=%s",
+                "essfield row=%s | name=%s | type=%s | matched_key=%s | activity=%s | owner=%s | creation=%s | date_range=%s | created_by=%s",
                 i + 1,
                 item.visible_name,
                 item.inferred_type,
                 item.matched_key,
+                item.activity_name,
                 item.owner_text,
                 item.creation_date,
                 item.date_range,
@@ -476,7 +519,14 @@ def _parse_row_locators(rows, logger=None) -> list[SavedReportItem]:
             )
 
             key, ambiguous = match_target_key(normalized_name)
-            matched_key = None if ambiguous else key
+            matched_key = None
+            activity_name = None
+            activity_key = None
+            if (not ambiguous) and key:
+                activity_name = extract_activity_name(visible_name, key)
+                if activity_name:
+                    activity_key = normalize_activity_key(activity_name)
+                    matched_key = key
             inferred_type = _infer_type(
                 normalized_name=normalized_name,
                 has_download_text=has_download_text,
@@ -489,6 +539,8 @@ def _parse_row_locators(rows, logger=None) -> list[SavedReportItem]:
                 visible_name=visible_name,
                 normalized_name=normalized_name,
                 inferred_type=inferred_type,
+                activity_name=activity_name,
+                activity_key=activity_key,
                 row_text=row_text,
                 matched_key=matched_key,
                 owner_text=owner_text,
@@ -502,13 +554,14 @@ def _parse_row_locators(rows, logger=None) -> list[SavedReportItem]:
             items.append(item)
             if logger:
                 logger.info(
-                    "row=%s | name=%s | type=%s | download_text=%s | download_icon=%s | matched_key=%s | owner=%s | created_by=%s",
+                    "row=%s | name=%s | type=%s | download_text=%s | download_icon=%s | matched_key=%s | activity=%s | owner=%s | created_by=%s",
                     index,
                     item.visible_name,
                     item.inferred_type,
                     item.has_download_text,
                     item.has_download_icon,
                     item.matched_key,
+                    item.activity_name,
                     item.owner_text,
                     item.created_by,
                 )
@@ -543,6 +596,53 @@ def match_targets(items: list[SavedReportItem], logger=None) -> dict[str, SavedR
         if logger:
             logger.warning("ambiguous target key detected: %s", key)
     return mapping
+
+
+def match_targets_by_activity(
+    items: list[SavedReportItem],
+    logger=None,
+) -> dict[str, dict[str, SavedReportItem]]:
+    """
+    Return unique matches by activity_key and target_key.
+
+    Rules:
+    - items without both matched_key and activity_key are ignored
+    - duplicate target_key within same activity_key is ambiguous and excluded
+    - duplicate target_key across different activity_key values is allowed
+    """
+    mapping: dict[str, dict[str, SavedReportItem]] = {}
+    ambiguous_keys: dict[str, set[str]] = {}
+
+    for item in items:
+        if not item.matched_key or not item.activity_key:
+            continue
+        activity_key = item.activity_key
+        target_key = item.matched_key
+        activity_targets = mapping.setdefault(activity_key, {})
+        if target_key in activity_targets:
+            ambiguous = ambiguous_keys.setdefault(activity_key, set())
+            ambiguous.add(target_key)
+            activity_targets[target_key].matched_key = None
+            item.matched_key = None
+            continue
+        activity_targets[target_key] = item
+
+    for activity_key, target_keys in ambiguous_keys.items():
+        activity_targets = mapping.get(activity_key, {})
+        for target_key in target_keys:
+            activity_targets.pop(target_key, None)
+            if logger:
+                logger.warning(
+                    "ambiguous target key detected | activity=%s | target=%s",
+                    activity_key,
+                    target_key,
+                )
+
+    return {
+        activity_key: activity_targets
+        for activity_key, activity_targets in mapping.items()
+        if activity_targets
+    }
 
 
 def _wait_for_table_area(root) -> None:
@@ -1028,7 +1128,7 @@ def _infer_type(
     # Report prefixes are authoritative even if row has load/download controls.
     if matched_key in REPORT_KEYS:
         return "report"
-    if normalized_name.startswith("bcg_demographics") or normalized_name.startswith("bcg_placements"):
+    if normalized_name.startswith("bcg_auto_demographics") or normalized_name.startswith("bcg_auto_placements"):
         return "report"
     if has_download_text:
         return "view"
@@ -1145,6 +1245,8 @@ def _scan_by_name_elements(scope, logger=None, scope_label: str = "root") -> lis
             visible_name=visible_name,
             normalized_name=normalized_name,
             inferred_type=inferred_type,
+            activity_name=None,
+            activity_key=None,
             row_text=visible_name,
             matched_key=matched_key,
             owner_text=None,
@@ -1245,6 +1347,8 @@ def _scan_by_saved_reports_text(root, logger=None) -> list[SavedReportItem]:
             visible_name=name,
             normalized_name=normalized_name,
             inferred_type=inferred_type,
+            activity_name=None,
+            activity_key=None,
             row_text=name,
             matched_key=matched_key,
             owner_text=None,
