@@ -3,8 +3,13 @@
 from __future__ import annotations
 
 import re
+from typing import TYPE_CHECKING, Any
 
-from playwright.sync_api import Frame, Page
+if TYPE_CHECKING:
+    from playwright.sync_api import Frame, Page
+else:
+    Frame = Any
+    Page = Any
 
 from .config import TABLE_SCAN_TIMEOUT_MS
 from .models import SavedReportItem
@@ -271,18 +276,18 @@ def _materialize_saved_reports_rows(root, logger=None) -> None:
 
 
 def _get_owner_page(root) -> Page:
-    if isinstance(root, Page):
+    if _is_page_like(root):
         return root
-    if isinstance(root, Frame):
+    if _is_frame_like(root):
         return root.page
     # fallback for Page-like objects
     return root.page
 
 
 def _root_label(root) -> str:
-    if isinstance(root, Page):
+    if _is_page_like(root):
         return f"page(url={root.url})"
-    if isinstance(root, Frame):
+    if _is_frame_like(root):
         name = root.name or "(no-name)"
         return f"frame(name={name}, url={root.url})"
     return f"root(type={type(root).__name__})"
@@ -759,14 +764,22 @@ def _resolve_show_rows_button(panel):
 
 
 def _owner_page_from_scope(scope) -> Page:
-    if isinstance(scope, Page):
+    if _is_page_like(scope):
         return scope
-    if isinstance(scope, Frame):
+    if _is_frame_like(scope):
         return scope.page
     try:
         return scope.page
     except Exception:  # noqa: BLE001
         raise RuntimeError("unable to resolve owner page from scope")
+
+
+def _is_page_like(obj) -> bool:
+    return hasattr(obj, "frames") and hasattr(obj, "url")
+
+
+def _is_frame_like(obj) -> bool:
+    return hasattr(obj, "page") and not hasattr(obj, "frames")
 
 
 def _reset_scope_scroll(scope, owner_page: Page) -> None:

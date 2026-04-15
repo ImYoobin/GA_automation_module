@@ -16,7 +16,13 @@ from pathlib import Path
 from typing import Any
 
 from .account_discovery import collect_accounts
-from .auth import ensure_logged_in, launch_ads_context, minimize_browser_window
+from .auth import (
+    ensure_logged_in,
+    get_browser_window_state,
+    launch_ads_context,
+    maximize_browser_window,
+    minimize_browser_window,
+)
 from .google_excel_builder import create_unified_workbook_for_account, summaries_as_rows
 from .main import _download_targets_for_account, ensure_account_report_editor_ready, scan_account_saved_reports
 from .models import AdsAccount, DownloadResult, SavedReportItem
@@ -67,7 +73,61 @@ def _focus_browser_page(page, logger=None) -> None:
             logger.info("browser bring_to_front skipped: %s", exc)
 
 
-def _minimize_browser_page(page, logger=None) -> None:
+def _default_window_policy() -> dict[str, Any]:
+    return {
+        "keep_minimized": False,
+        "user_override": False,
+        "last_auto_state": "",
+    }
+
+
+def _maximize_browser_page(page, logger=None) -> None:
+    pages = [page]
+    try:
+        context_pages = [candidate for candidate in page.context.pages if not candidate.is_closed()]
+        if context_pages:
+            pages = context_pages
+    except Exception:  # noqa: BLE001
+        pages = [page]
+
+    success = False
+    for candidate in pages:
+        success = maximize_browser_window(candidate, logger=logger) or success
+    if logger:
+        logger.info("browser maximize request | success=%s | page_count=%s", success, len(pages))
+
+
+def _detect_user_window_override(page, window_policy: dict[str, Any], logger=None) -> bool:
+    if not window_policy.get("keep_minimized"):
+        return False
+    if window_policy.get("user_override"):
+        return True
+    if not window_policy.get("last_auto_state"):
+        return False
+
+    state = get_browser_window_state(page, logger=logger)
+    if not state:
+        return False
+    if state == str(window_policy.get("last_auto_state", "")).strip().lower():
+        return False
+
+    window_policy["user_override"] = True
+    if logger:
+        logger.info(
+            "browser window override detected | observed_state=%s | last_auto_state=%s",
+            state,
+            window_policy.get("last_auto_state"),
+        )
+    return True
+
+
+def _minimize_browser_page(page, logger=None, window_policy: dict[str, Any] | None = None) -> None:
+    policy = window_policy or _default_window_policy()
+    if policy.get("keep_minimized") and _detect_user_window_override(page, policy, logger=logger):
+        if logger:
+            logger.info("browser minimize keepalive skipped due to user override")
+        return
+
     pages = [page]
     try:
         context_pages = [candidate for candidate in page.context.pages if not candidate.is_closed()]
@@ -81,8 +141,17 @@ def _minimize_browser_page(page, logger=None) -> None:
         minimized = minimize_browser_window(candidate, logger=logger)
         success = success or minimized
 
+    if success and policy.get("keep_minimized"):
+        policy["last_auto_state"] = "minimized"
+
     if logger:
-        logger.info("browser minimize keepalive | success=%s | page_count=%s", success, len(pages))
+        logger.info(
+            "browser minimize keepalive | success=%s | page_count=%s | keep_minimized=%s | user_override=%s",
+            success,
+            len(pages),
+            policy.get("keep_minimized"),
+            policy.get("user_override"),
+        )
 
 
 def _account_to_dict(account: AdsAccount) -> dict[str, Any]:
@@ -341,25 +410,9 @@ def _worker_scan_and_export(
     stop_event, heartbeat_thread = _start_worker_heartbeat(event_queue)
     try:
         selected_accounts = [_account_from_dict(item) for item in selected_accounts_payload]
-        scan_results = scan_selected_accounts(
+        scan_results, scan_rows = run_google_export_for_accounts(
             selected_accounts=selected_accounts,
-            browser=browser,
-            headless=headless,
-            target_map_path=target_map_path,
-            logger=logger,
-            progress_cb=event_queue.put,
-        )
-        scan_rows = _scan_results_as_rows(scan_results)
-        event_queue.put({"type": "scan_results", "rows": scan_rows})
-        event_queue.put(
-            {
-                "type": "run_warning",
-                "message": "Matching completed. Export starting.",
-            }
-        )
-        run_google_export_for_accounts(
-            selected_accounts=selected_accounts,
-            scan_results=scan_results,
+            scan_results={},
             browser=browser,
             headless=headless,
             target_map_path=target_map_path,
@@ -367,6 +420,7 @@ def _worker_scan_and_export(
             downloads_dir=Path(downloads_dir).expanduser().resolve(),
             logger=logger,
             progress_cb=event_queue.put,
+            scan_before_export=True,
         )
         result_queue.put(
             {
@@ -625,7 +679,9 @@ def login_and_crawl_accounts(
                 logger=logger,
             )
             try:
+                window_policy = _default_window_policy()
                 _focus_browser_page(page, logger=logger)
+                _maximize_browser_page(page, logger=logger)
                 page = ensure_logged_in(page, logger=logger)
                 _emit(
                     progress_cb,
@@ -635,7 +691,8 @@ def login_and_crawl_accounts(
                         "message": "Google Ads login confirmed.",
                     },
                 )
-                _minimize_browser_page(page, logger=logger)
+                window_policy["keep_minimized"] = True
+                _minimize_browser_page(page, logger=logger, window_policy=window_policy)
                 accounts = collect_accounts(page, logger=logger)
                 _emit(
                     progress_cb,
@@ -685,26 +742,18 @@ def scan_selected_accounts(
             logger=logger,
         )
         try:
+            window_policy = _default_window_policy()
+            _focus_browser_page(page, logger=logger)
+            _maximize_browser_page(page, logger=logger)
             page = ensure_logged_in(page, logger=logger)
-            _minimize_browser_page(page, logger=logger)
+            window_policy["keep_minimized"] = True
+            _minimize_browser_page(page, logger=logger, window_policy=window_policy)
             discovered_now = collect_accounts(page, logger=logger)
             discovered_by_cid = {account.cid_digits: account for account in discovered_now}
 
             for selected in selected_accounts:
                 account = discovered_by_cid.get(selected.cid_digits, selected)
-                _minimize_browser_page(page, logger=logger)
-                _emit(
-                    progress_cb,
-                    {
-                        "type": "account_stage",
-                        "account": account.name,
-                        "cid": account.cid,
-                        "activity": "-",
-                        "stage": "매칭",
-                        "status": "Exporting",
-                        "message": "액티비티 매칭 진행중",
-                    },
-                )
+                _minimize_browser_page(page, logger=logger, window_policy=window_policy)
 
                 try:
                     items, matched_map_by_activity = scan_account_saved_reports(
@@ -738,19 +787,6 @@ def scan_selected_accounts(
                                     "message": row_item.visible_name if row_item else "report not found",
                                 },
                             )
-
-                    _emit(
-                        progress_cb,
-                        {
-                            "type": "account_stage",
-                            "account": account.name,
-                            "cid": account.cid,
-                            "activity": "-",
-                            "stage": "매칭",
-                            "status": "Completed",
-                            "message": f"매칭 완료: {len(matched_map_by_activity)} activities",
-                        },
-                    )
                     results[account.cid_digits] = {
                         "account": account,
                         "items": items,
@@ -793,7 +829,8 @@ def run_google_export_for_accounts(
     downloads_dir: Path,
     logger,
     progress_cb: ProgressCallback | None = None,
-) -> None:
+    scan_before_export: bool = False,
+) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
     from playwright.sync_api import sync_playwright
 
     run_id = _now_run_id()
@@ -816,7 +853,7 @@ def run_google_export_for_accounts(
                 "error": "No selected accounts for export.",
             },
         )
-        return
+        return {}, []
 
     try:
         load_target_mapping_file(target_map_path, logger=logger)
@@ -828,7 +865,7 @@ def run_google_export_for_accounts(
                 "error": str(exc),
             },
         )
-        return
+        return {}, []
 
     _ensure_playwright_event_loop_policy(logger=logger)
 
@@ -836,6 +873,9 @@ def run_google_export_for_accounts(
     downloads_dir = Path(downloads_dir).expanduser().resolve()
     final_output_dir.mkdir(parents=True, exist_ok=True)
     downloads_dir.mkdir(parents=True, exist_ok=True)
+
+    effective_scan_results: dict[str, dict[str, Any]] = dict(scan_results or {})
+    scan_rows: list[dict[str, Any]] = []
 
     _emit(
         progress_cb,
@@ -855,7 +895,21 @@ def run_google_export_for_accounts(
                 logger=logger,
             )
             try:
-                page = ensure_logged_in(page, logger=logger)
+                window_policy = _default_window_policy()
+                window_policy["keep_minimized"] = True
+                _minimize_browser_page(page, logger=logger, window_policy=window_policy)
+
+                def _on_manual_login_required(login_page) -> None:
+                    _focus_browser_page(login_page, logger=logger)
+                    _maximize_browser_page(login_page, logger=logger)
+                    window_policy["last_auto_state"] = "maximized"
+                    window_policy["user_override"] = False
+
+                page = ensure_logged_in(
+                    page,
+                    logger=logger,
+                    on_manual_login_required=_on_manual_login_required,
+                )
                 _emit(
                     progress_cb,
                     {
@@ -864,9 +918,84 @@ def run_google_export_for_accounts(
                         "message": "Google Ads login confirmed.",
                     },
                 )
-                _minimize_browser_page(page, logger=logger)
+                _minimize_browser_page(page, logger=logger, window_policy=window_policy)
                 discovered_now = collect_accounts(page, logger=logger)
                 discovered_by_cid = {account.cid_digits: account for account in discovered_now}
+
+                if scan_before_export:
+                    effective_scan_results = {}
+                    for selected in selected_accounts:
+                        account = discovered_by_cid.get(selected.cid_digits, selected)
+                        _minimize_browser_page(page, logger=logger, window_policy=window_policy)
+                        try:
+                            items, matched_map_by_activity = scan_account_saved_reports(
+                                page=page,
+                                account=account,
+                                logger=logger,
+                            )
+                            for activity_key in sorted(matched_map_by_activity.keys()):
+                                matched_map = matched_map_by_activity.get(activity_key, {})
+                                if not isinstance(matched_map, dict):
+                                    continue
+                                activity_name = _resolve_activity_name(activity_key=activity_key, matched_map=matched_map)
+                                for target_key in TARGET_ORDER:
+                                    row_item = matched_map.get(target_key)
+                                    _emit(
+                                        progress_cb,
+                                        {
+                                            "type": "row_update",
+                                            "row_id": _row_id(
+                                                cid_digits=account.cid_digits,
+                                                activity_key=activity_key,
+                                                target_key=target_key,
+                                            ),
+                                            "account": account.name,
+                                            "cid": account.cid,
+                                            "activity": activity_name,
+                                            "activity_key": activity_key,
+                                            "target_key": target_key,
+                                            "target_display": TARGET_DISPLAY_NAMES.get(target_key, target_key),
+                                            "status": "Matched" if row_item else "Not Found",
+                                            "message": row_item.visible_name if row_item else "report not found",
+                                        },
+                                    )
+                            effective_scan_results[account.cid_digits] = {
+                                "account": account,
+                                "items": items,
+                                "matched_map_by_activity": matched_map_by_activity,
+                            }
+                        except Exception as exc:  # noqa: BLE001
+                            error_text = _exc_text(exc)
+                            _emit(
+                                progress_cb,
+                                {
+                                    "type": "account_stage",
+                                    "account": account.name,
+                                    "cid": account.cid,
+                                    "activity": "-",
+                                    "stage": "매칭",
+                                    "status": "Failed",
+                                    "message": error_text,
+                                },
+                            )
+                            effective_scan_results[account.cid_digits] = {
+                                "account": account,
+                                "items": [],
+                                "matched_map_by_activity": {},
+                                "error": error_text,
+                            }
+
+                    scan_rows = _scan_results_as_rows(effective_scan_results)
+                    _emit(progress_cb, {"type": "scan_results", "rows": scan_rows})
+                    _emit(
+                        progress_cb,
+                        {
+                            "type": "run_warning",
+                            "message": "Matching completed. Export starting.",
+                        },
+                    )
+                else:
+                    scan_rows = _scan_results_as_rows(effective_scan_results)
 
                 outputs_count = 0
                 skipped_activities = 0
@@ -874,12 +1003,12 @@ def run_google_export_for_accounts(
                 for selected in selected_accounts:
                     account = discovered_by_cid.get(selected.cid_digits, selected)
                     account_label = f"{account.name} | {account.cid}"
-                    _minimize_browser_page(page, logger=logger)
+                    _minimize_browser_page(page, logger=logger, window_policy=window_policy)
                     matched_map_by_activity: dict[str, dict[str, SavedReportItem]] = (
-                        scan_results.get(selected.cid_digits, {}).get("matched_map_by_activity", {})
+                        effective_scan_results.get(selected.cid_digits, {}).get("matched_map_by_activity", {})
                     )
                     if not matched_map_by_activity:
-                        matched_map_by_activity = scan_results.get(account.cid_digits, {}).get(
+                        matched_map_by_activity = effective_scan_results.get(account.cid_digits, {}).get(
                             "matched_map_by_activity",
                             {},
                         )
@@ -901,7 +1030,7 @@ def run_google_export_for_accounts(
 
                     try:
                         ensure_account_report_editor_ready(page=page, account=account, logger=logger)
-                        _minimize_browser_page(page, logger=logger)
+                        _minimize_browser_page(page, logger=logger, window_policy=window_policy)
 
                         for activity_key in sorted(matched_map_by_activity.keys()):
                             matched_map = matched_map_by_activity.get(activity_key, {})
@@ -973,7 +1102,7 @@ def run_google_export_for_accounts(
                                 1 for result in result_by_target.values() if result.success and result.filename
                             )
                             if failed_retry_targets:
-                                _minimize_browser_page(page, logger=logger)
+                                _minimize_browser_page(page, logger=logger, window_policy=window_policy)
                                 _emit(
                                     progress_cb,
                                     {
@@ -1080,6 +1209,14 @@ def run_google_export_for_accounts(
                                     "message": "통합본 생성중",
                                 },
                             )
+                            if logger:
+                                logger.info(
+                                    "unified workbook build start | account=%s(%s) | activity=%s | files=%s",
+                                    account.name,
+                                    account.cid,
+                                    activity_name,
+                                    [result.filename for result in download_results if result.filename],
+                                )
                             output_path, summaries = create_unified_workbook_for_account(
                                 account=account,
                                 download_results=download_results,
@@ -1153,6 +1290,13 @@ def run_google_export_for_accounts(
                                 )
                     except Exception as exc:  # noqa: BLE001
                         error_text = _exc_text(exc)
+                        if logger:
+                            logger.exception(
+                                "account export failed | account=%s(%s) | reason=%s",
+                                account.name,
+                                account.cid,
+                                error_text,
+                            )
                         _emit(
                             progress_cb,
                             {
@@ -1207,4 +1351,5 @@ def run_google_export_for_accounts(
                     )
             finally:
                 context.close()
+    return effective_scan_results, scan_rows
 

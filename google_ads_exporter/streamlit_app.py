@@ -34,6 +34,7 @@ from google_ads_exporter.utils import setup_logger
 STATUS_LABEL = {
     "waiting": "Waiting",
     "exporting": "Exporting",
+    "downloaded": "Downloaded",
     "completed": "Completed",
     "failed": "Failed",
 }
@@ -41,6 +42,7 @@ STATUS_LABEL = {
 STATUS_STYLE = {
     "waiting": "background-color: #f1f5f9; color: #64748b; font-weight: 600;",
     "exporting": "background-color: #dbeafe; color: #1d4ed8; font-weight: 700;",
+    "downloaded": "background-color: #dcfce7; color: #166534; font-weight: 700;",
     "completed": "background-color: #dff3e6; color: #166534; font-weight: 700;",
     "failed": "background-color: #fee2e2; color: #b91c1c; font-weight: 700;",
 }
@@ -517,7 +519,7 @@ def _render_main_login_section(snapshot: dict[str, Any]) -> None:
             "로그인하기",
             type="primary",
             disabled=is_running,
-            use_container_width=True,
+            width="stretch",
             key="main_start_btn",
         ):
             with st.spinner("Google Ads 로그인 확인 및 계정 크롤링 중입니다..."):
@@ -541,9 +543,11 @@ def _prepare_run_directories() -> dict[str, str]:
     downloads_base = _safe_path(_safe_text(st.session_state.get("downloads_dir")))
     logs_base = _safe_path(_safe_text(st.session_state.get("logs_dir")))
 
-    run_output_dir = (output_base / run_date / "output").resolve()
-    run_downloads_dir = (downloads_base / run_date / "raw").resolve()
-    run_logs_dir = (logs_base / run_date / "log").resolve()
+    # Keep runtime paths relative to each configured base directory:
+    # output/<YYYYMMDD>, downloads/<YYYYMMDD>, logs/<YYYYMMDD>
+    run_output_dir = (output_base / run_date).resolve()
+    run_downloads_dir = (downloads_base / run_date).resolve()
+    run_logs_dir = (logs_base / run_date).resolve()
 
     run_output_dir.mkdir(parents=True, exist_ok=True)
     run_downloads_dir.mkdir(parents=True, exist_ok=True)
@@ -701,7 +705,7 @@ def _render_account_selector(snapshot: dict[str, Any]) -> None:
 
     edited = st.data_editor(
         pd.DataFrame(rows),
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
         column_config={
             "export": st.column_config.CheckboxColumn("Export", default=False),
@@ -745,7 +749,7 @@ def _render_proceed_export(snapshot: dict[str, Any]) -> None:
     if st.button(
         "Export하기",
         type="primary",
-        use_container_width=True,
+        width="stretch",
         disabled=disabled,
         key="proceed_export_btn",
     ):
@@ -829,9 +833,11 @@ def _ui_phase_key(value: Any) -> str:
     key = _normalized_status_key(value)
     if key in {"failed", "error"}:
         return "failed"
+    if key in {"downloaded"}:
+        return "downloaded"
     if key in {"completed", "excel_written"}:
         return "completed"
-    if key in {"downloading", "downloaded", "exporting"}:
+    if key in {"downloading", "exporting"}:
         return "exporting"
     if key in {"pending", "scanning", "matched", "not found", "ready", "waiting"}:
         return "waiting"
@@ -889,7 +895,7 @@ def _render_bottom_section(snapshot: dict[str, Any]) -> None:
             }
         )
         styled_row_df = _style_status_column(row_df, "상태")
-        st.dataframe(styled_row_df, use_container_width=True, hide_index=True)
+        st.dataframe(styled_row_df, width="stretch", hide_index=True)
     else:
         st.markdown(
             "<div class='ga-disabled-box'>실행 로그가 없습니다.</div>",
@@ -943,7 +949,7 @@ def _render_bottom_section(snapshot: dict[str, Any]) -> None:
         )
         account_stage_df = account_stage_df.sort_values(by=["시간"], ascending=False)
         styled_account_stage_df = _style_status_column(account_stage_df, "상태")
-        st.dataframe(styled_account_stage_df, use_container_width=True, hide_index=True)
+        st.dataframe(styled_account_stage_df, width="stretch", hide_index=True)
     else:
         st.markdown(
             "<div class='ga-disabled-box'>다운로드 후 통합본 생성 상태가 표시됩니다.</div>",

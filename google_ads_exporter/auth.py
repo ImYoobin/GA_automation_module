@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from typing import Sequence
+from collections.abc import Callable, Sequence
 
 from playwright.sync_api import BrowserContext, Page, Playwright
 
@@ -89,31 +89,70 @@ def minimize_browser_window(page: Page, logger=None) -> bool:
     Minimize current Chromium-based window via CDP.
     Returns True on success, False otherwise.
     """
+    return _set_browser_window_state(page, "minimized", logger=logger)
+
+
+def maximize_browser_window(page: Page, logger=None) -> bool:
+    """
+    Maximize current Chromium-based window via CDP.
+    Returns True on success, False otherwise.
+    """
+    return _set_browser_window_state(page, "maximized", logger=logger)
+
+
+def get_browser_window_state(page: Page, logger=None) -> str:
+    """
+    Return current window state (e.g. minimized/maximized/normal/fullscreen).
+    Returns empty string on failure.
+    """
+    try:
+        session = page.context.new_cdp_session(page)
+        window_info = session.send("Browser.getWindowForTarget")
+        bounds = window_info.get("bounds", {}) if isinstance(window_info, dict) else {}
+        state = str(bounds.get("windowState") or "").strip().lower()
+        return state
+    except Exception as exc:  # noqa: BLE001
+        if logger:
+            logger.info("browser get window state skipped reason=%s", exc)
+        return ""
+
+
+def _set_browser_window_state(page: Page, state: str, logger=None) -> bool:
+    normalized = str(state or "").strip().lower()
+    if normalized not in {"minimized", "maximized", "normal", "fullscreen"}:
+        if logger:
+            logger.info("browser window state change skipped: unsupported state=%s", state)
+        return False
+
     try:
         session = page.context.new_cdp_session(page)
         window_info = session.send("Browser.getWindowForTarget")
         window_id = window_info.get("windowId")
         if not window_id:
             if logger:
-                logger.info("browser minimize skipped: windowId unavailable")
+                logger.info("browser window state change skipped: windowId unavailable")
             return False
         session.send(
             "Browser.setWindowBounds",
             {
                 "windowId": window_id,
-                "bounds": {"windowState": "minimized"},
+                "bounds": {"windowState": normalized},
             },
         )
         if logger:
-            logger.info("browser window minimized")
+            logger.info("browser window state changed state=%s", normalized)
         return True
     except Exception as exc:  # noqa: BLE001
         if logger:
-            logger.warning("browser minimize failed reason=%s", exc)
+            logger.warning("browser window state change failed state=%s reason=%s", normalized, exc)
         return False
 
 
-def ensure_logged_in(page: Page, logger=None) -> Page:
+def ensure_logged_in(
+    page: Page,
+    logger=None,
+    on_manual_login_required: Callable[[Page], None] | None = None,
+) -> Page:
     """
     Provider-agnostic login validation:
       1) wait until sign-in URL is cleared
@@ -133,6 +172,12 @@ def ensure_logged_in(page: Page, logger=None) -> Page:
         current_url = _page_url(current_page)
 
         if _is_signin_url(current_url):
+            if not manual_login_required and on_manual_login_required is not None:
+                try:
+                    on_manual_login_required(current_page)
+                except Exception as exc:  # noqa: BLE001
+                    if logger:
+                        logger.info("manual login callback skipped reason=%s", exc)
             manual_login_required = True
             if logger:
                 logger.info("manual login required. current_url=%s", current_url)
