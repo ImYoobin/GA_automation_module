@@ -7,7 +7,7 @@ import os
 import re
 import traceback
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from playwright.sync_api import sync_playwright
 
@@ -16,7 +16,7 @@ from .account_discovery import collect_accounts
 from .account_selector_ui import pick_accounts
 from .auth import assert_session_active, ensure_logged_in, launch_ads_context, minimize_browser_window
 from .config import SAVED_REPORT_SCAN_RETRIES
-from .downloader import download_item
+from .downloader import PENDING_DOWNLOAD_REASON, download_item, finalize_background_download_results
 from .env import load_env_file
 from .models import AdsAccount, DownloadResult, SavedReportItem
 from .report_editor import (
@@ -350,6 +350,7 @@ def _download_targets_for_account(
     if logger:
         logger.info("download output directory=%s", output_dir)
     results: list[DownloadResult] = []
+    lookup_state: dict[str, Any] = {"prefer_reports_asc": False}
 
     def emit_progress(target_key: str, status: str, detail: str | None = None) -> None:
         if progress_callback is None:
@@ -413,6 +414,7 @@ def _download_targets_for_account(
             output_dir,
             activity_name=activity_name,
             activity_key=activity_key,
+            lookup_state=lookup_state,
             logger=logger,
         )
         results.append(result)
@@ -424,7 +426,10 @@ def _download_targets_for_account(
             result.filename,
         )
         if result.success:
-            emit_progress(target_key, "downloaded", result.filename)
+            if result.reason == PENDING_DOWNLOAD_REASON:
+                emit_progress(target_key, "exporting", "Downloading detected. Waiting for file save...")
+            else:
+                emit_progress(target_key, "downloaded", result.filename)
         else:
             emit_progress(target_key, "failed", result.reason or "download failed")
 
@@ -436,6 +441,33 @@ def _download_targets_for_account(
                 target_key,
                 restored,
             )
+
+    pending_targets = {
+        result.target_key for result in results if result.success and result.reason == PENDING_DOWNLOAD_REASON
+    }
+    if pending_targets and logger:
+        logger.info(
+            "background download pending finalize start | account=%s(%s) | activity=%s | pending=%s",
+            account.name,
+            account.cid,
+            activity_name or activity_key or "-",
+            sorted(pending_targets),
+        )
+
+    finalize_background_download_results(
+        results=results,
+        lookup_state=lookup_state,
+        logger=logger,
+    )
+
+    if pending_targets:
+        for result in results:
+            if result.target_key not in pending_targets:
+                continue
+            if result.success and result.filename:
+                emit_progress(result.target_key, "downloaded", result.filename)
+            else:
+                emit_progress(result.target_key, "failed", result.reason or "background download failed")
     return results
 
 
@@ -635,7 +667,11 @@ def _target_row_visible_once(page, visible_name: str) -> bool:
 def _try_set_show_rows_to_500_for_restore(page) -> None:
     if _is_report_view_page(page):
         return
-    button = page.locator("div[role='button'][aria-label*='Show rows']").first
+    panel = _resolve_saved_reports_panel_for_restore(page)
+    if panel.count() == 0:
+        return
+
+    button = panel.locator("div[role='button'][aria-label*='Show rows']").first
     if button.count() == 0:
         return
     try:
@@ -647,7 +683,7 @@ def _try_set_show_rows_to_500_for_restore(page) -> None:
         pass
     try:
         button.click(timeout=1500)
-        listbox = page.locator(
+        listbox = panel.locator(
             "material-list[role='listbox'][aria-label*='Choose number of rows to be displayed per page']"
         ).first
         if listbox.count() == 0:
@@ -659,6 +695,16 @@ def _try_set_show_rows_to_500_for_restore(page) -> None:
             page.wait_for_timeout(350)
     except Exception:  # noqa: BLE001
         return
+
+
+def _resolve_saved_reports_panel_for_restore(page):
+    panel = page.locator("material-expansionpanel:has(div[role='button'][aria-label='Saved reports'])").first
+    if panel.count() > 0:
+        return panel
+    panel = page.locator("material-expansionpanel:has-text('Saved reports')").first
+    if panel.count() > 0:
+        return panel
+    return page.locator("material-expansionpanel:has([essfield='definition.report_name'])").first
 
 
 def _scroll_saved_reports_for_target_lookup(page) -> None:

@@ -5,8 +5,12 @@ from __future__ import annotations
 from datetime import datetime
 from pathlib import Path
 import re
+from typing import TYPE_CHECKING, Any
 
-from playwright.sync_api import Page
+if TYPE_CHECKING:
+    from playwright.sync_api import Page
+else:
+    Page = Any
 
 from .config import DOWNLOAD_CLICK_RETRIES, DOWNLOAD_TIMEOUT_MS, MEDIUM_WAIT_MS
 from .models import AdsAccount, DownloadResult, SavedReportItem
@@ -16,11 +20,17 @@ from .utils import normalize_report_name, sanitize_filename
 REPORT_VIEW_LOAD_TIMEOUT_MS = 14000
 VIEW_BASE_READY_TIMEOUT_MS = 6500
 VIEW_STABILIZE_WAIT_MS = 1000
-ROW_LOOKUP_MAX_SCROLL_ROUNDS = 26
+ROW_LOOKUP_MAX_SCROLL_ROUNDS = 72
+ROW_LOOKUP_STAGNATION_LIMIT = 3
 SHOW_ROWS_BUTTON_SELECTOR = "div[role='button'][aria-label*='Show rows']"
+SHOW_ROWS_BUTTON_FALLBACK_SELECTOR = "div[role='button']:has(span.button-text)"
 SHOW_ROWS_LISTBOX_SELECTOR = (
     "material-list[role='listbox'][aria-label*='Choose number of rows to be displayed per page']"
 )
+ROW_COUNT_REGEX = re.compile(r"^(10|25|50|100|250|500|1000)$")
+PAGINATION_TEXT_REGEX = re.compile(r"\b\d+\s*-\s*\d+\s+of\s+\d+\b", re.IGNORECASE)
+REPORT_DOWNLOAD_START_TIMEOUT_MS = 240000
+PENDING_DOWNLOAD_REASON = "background_download_pending"
 
 
 def download_item(
@@ -30,17 +40,61 @@ def download_item(
     output_dir: Path,
     activity_name: str = "",
     activity_key: str = "",
+    lookup_state: dict[str, Any] | None = None,
     logger=None,
 ) -> DownloadResult:
     is_report = _is_report_target(item)
     last_reason = "download click failed"
+    if lookup_state is None:
+        lookup_state = {}
 
     for attempt in range(DOWNLOAD_CLICK_RETRIES + 1):
+        prefer_reports_asc = bool(lookup_state.get("prefer_reports_asc"))
         _set_show_rows_to_500(page, logger=logger)
+        if prefer_reports_asc:
+            _apply_reports_sort_fallback(page, logger=logger, reason="sticky_asc")
         row = _find_row_for_item_with_scroll(page, item, logger=logger)
         if row is None:
-            last_reason = "report row not found in Saved reports table"
-            continue
+            diagnostics = _collect_row_lookup_diagnostics(page, item)
+            _log_row_lookup_miss(
+                page,
+                item,
+                attempt=attempt + 1,
+                logger=logger,
+                phase="before_sort_fallback" if not prefer_reports_asc else "sticky_asc_miss",
+                diagnostics=diagnostics,
+            )
+
+            fallback_applied = False
+            if not prefer_reports_asc:
+                fallback_applied = _apply_reports_sort_fallback(
+                    page,
+                    logger=logger,
+                    reason="row_not_found",
+                )
+                if fallback_applied:
+                    lookup_state["prefer_reports_asc"] = True
+                    row = _find_row_for_item_with_scroll(page, item, logger=logger)
+                    if row is not None:
+                        if logger:
+                            logger.info(
+                                "row lookup recovered after sort fallback | target=%s | activity=%s",
+                                item.matched_key,
+                                item.activity_name or item.activity_key or "-",
+                            )
+
+            if row is None:
+                post_diagnostics = _collect_row_lookup_diagnostics(page, item)
+                _log_row_lookup_miss(
+                    page,
+                    item,
+                    attempt=attempt + 1,
+                    logger=logger,
+                    phase="after_sort_fallback" if fallback_applied else "without_sort_fallback",
+                    diagnostics=post_diagnostics,
+                )
+                last_reason = _build_row_miss_reason(post_diagnostics)
+                continue
 
         if is_report:
             saved, reason = _try_report_download(
@@ -50,6 +104,7 @@ def download_item(
                 item,
                 output_dir,
                 activity_name=activity_name,
+                lookup_state=lookup_state,
                 logger=logger,
             )
         else:
@@ -60,6 +115,7 @@ def download_item(
                 item,
                 output_dir,
                 activity_name=activity_name,
+                lookup_state=lookup_state,
                 logger=logger,
             )
 
@@ -70,6 +126,7 @@ def download_item(
                 activity_name=activity_name,
                 activity_key=activity_key,
                 filename=saved.name,
+                reason=reason,
             )
 
         if reason:
@@ -99,6 +156,7 @@ def _try_view_download(
     item: SavedReportItem,
     output_dir: Path,
     activity_name: str = "",
+    lookup_state: dict[str, Any] | None = None,
     logger=None,
 ):
     """
@@ -208,6 +266,7 @@ def _try_report_download(
     item: SavedReportItem,
     output_dir: Path,
     activity_name: str = "",
+    lookup_state: dict[str, Any] | None = None,
     logger=None,
 ):
     """
@@ -230,8 +289,26 @@ def _try_report_download(
         return None, "csv menu item not found"
 
     try:
-        with page.expect_download(timeout=DOWNLOAD_TIMEOUT_MS) as download_info:
+        with page.expect_download(timeout=REPORT_DOWNLOAD_START_TIMEOUT_MS) as download_info:
             csv_item.click(timeout=5000)
+        queued_path = _queue_pending_download(
+            output_dir=output_dir,
+            account=account,
+            item=item,
+            activity_name=activity_name,
+            lookup_state=lookup_state,
+            download_obj=download_info.value,
+            logger=logger,
+        )
+        if queued_path is not None:
+            if logger:
+                logger.info(
+                    "report download started target=%s file=%s",
+                    item.matched_key,
+                    queued_path.name,
+                )
+            return queued_path, PENDING_DOWNLOAD_REASON
+
         saved = _save_download(download_info.value, output_dir, account, item, activity_name=activity_name)
         if logger:
             logger.info("download success (report-csv-menu) target=%s file=%s", item.matched_key, saved.name)
@@ -239,7 +316,7 @@ def _try_report_download(
     except Exception as exc:  # noqa: BLE001
         if logger:
             logger.warning("report csv menu click failed reason=%s", exc)
-        return None, "csv click/download timeout"
+        return None, "csv click/download timeout or start not detected"
 
 
 def _open_item_from_row(page: Page, row, item: SavedReportItem, logger=None) -> tuple[bool, str | None]:
@@ -398,11 +475,19 @@ def _find_row_for_item_with_scroll(page: Page, item: SavedReportItem, logger=Non
     if row is not None:
         return row
 
-    no_hit_rounds = 0
+    no_move_rounds = 0
     for round_idx in range(ROW_LOOKUP_MAX_SCROLL_ROUNDS):
         moved = _scroll_saved_reports_for_lookup(page)
         if not moved:
-            break
+            no_move_rounds += 1
+            if no_move_rounds >= ROW_LOOKUP_STAGNATION_LIMIT:
+                break
+        else:
+            no_move_rounds = 0
+
+        if round_idx > 0 and round_idx % 10 == 0:
+            _set_show_rows_to_500(page, logger=logger)
+
         row = _find_row_for_item_once(page, item)
         if row is not None:
             if logger:
@@ -412,9 +497,6 @@ def _find_row_for_item_with_scroll(page: Page, item: SavedReportItem, logger=Non
                     round_idx + 1,
                 )
             return row
-        no_hit_rounds += 1
-        if no_hit_rounds >= 4:
-            break
     return None
 
 
@@ -577,7 +659,7 @@ def _saved_reports_data_row_count(page: Page) -> int:
 def _set_show_rows_to_500(page: Page, logger=None) -> None:
     if _is_report_view_page(page):
         return
-    button = page.locator(SHOW_ROWS_BUTTON_SELECTOR).first
+    button = _resolve_show_rows_button(page)
     if button.count() == 0:
         return
 
@@ -620,6 +702,172 @@ def _set_show_rows_to_500(page: Page, logger=None) -> None:
     except Exception as exc:  # noqa: BLE001
         if logger:
             logger.info("download show rows option click failed | reason=%s", exc)
+
+
+def _resolve_show_rows_button(page: Page):
+    panel = _resolve_saved_reports_panel(page)
+    if panel.count() == 0:
+        return page.locator("div.__ga_saved_reports_show_rows_not_found__")
+
+    button = panel.locator(SHOW_ROWS_BUTTON_SELECTOR).first
+    if button.count() > 0:
+        return button
+
+    candidates = panel.locator(SHOW_ROWS_BUTTON_FALLBACK_SELECTOR)
+    count = candidates.count()
+    for i in range(count):
+        candidate = candidates.nth(i)
+        text = _safe_inner_text(candidate.locator("span.button-text").first)
+        if ROW_COUNT_REGEX.match(text):
+            return candidate
+
+    return panel.locator("div[role='button']").filter(has_text="500").first
+
+
+def _apply_reports_sort_fallback(page: Page, logger=None, reason: str = "") -> bool:
+    _ensure_saved_reports_panel_expanded(page, logger=logger)
+    _set_show_rows_to_500(page, logger=logger)
+    asc_ready = _ensure_reports_column_sort_ascending(page, logger=logger)
+    if logger:
+        logger.info(
+            "sort fallback applied | success=%s | reason=%s | url=%s",
+            asc_ready,
+            reason,
+            page.url,
+        )
+    return asc_ready
+
+
+def _ensure_saved_reports_panel_expanded(page: Page, logger=None) -> bool:
+    panel = _resolve_saved_reports_panel(page)
+    if panel.count() == 0:
+        return False
+
+    region = panel.locator("div.main[role='region'], div[role='region']").first
+    try:
+        hidden = (region.get_attribute("aria-hidden") or "").strip().lower() if region.count() > 0 else ""
+        if hidden == "false":
+            return True
+    except Exception:  # noqa: BLE001
+        pass
+
+    click_targets = [
+        panel.locator("div[role='button'][aria-label='Saved reports']").first,
+        panel.get_by_text("Saved reports", exact=False).first,
+        panel.locator("material-icon.expand-button").first,
+    ]
+    for target in click_targets:
+        if target.count() == 0:
+            continue
+        try:
+            target.click(timeout=1500)
+            page.wait_for_timeout(400)
+            if region.count() == 0:
+                return True
+            hidden = (region.get_attribute("aria-hidden") or "").strip().lower()
+            if hidden != "true":
+                return True
+        except Exception:  # noqa: BLE001
+            continue
+
+    if logger:
+        logger.info("saved reports expand fallback failed")
+    return False
+
+
+def _resolve_saved_reports_panel(page: Page):
+    panel = page.locator("material-expansionpanel:has(div[role='button'][aria-label='Saved reports'])").first
+    if panel.count() > 0:
+        return panel
+    panel = page.locator("material-expansionpanel:has-text('Saved reports')").first
+    if panel.count() > 0:
+        return panel
+    return page.locator("material-expansionpanel:has([essfield='definition.report_name'])").first
+
+
+def _resolve_saved_reports_grid(page: Page):
+    panel = _resolve_saved_reports_panel(page)
+    if panel.count() > 0:
+        grid = panel.locator(".ess-table-canvas[role='grid'], [role='grid']").first
+        if grid.count() > 0:
+            return grid
+    return page.locator(".ess-table-canvas[role='grid'], [role='grid']").first
+
+
+def _ensure_reports_column_sort_ascending(page: Page, logger=None) -> bool:
+    header = _resolve_reports_column_header(page)
+    if header is None:
+        if logger:
+            logger.info("reports sort fallback skipped | reason=reports_header_not_found")
+        return False
+
+    current_sort = _read_sort_state(header)
+    if current_sort == "ascending":
+        return True
+
+    for _ in range(2):
+        if not _click_reports_header(header):
+            break
+        page.wait_for_timeout(350)
+        current_sort = _read_sort_state(header)
+        if current_sort == "ascending":
+            return True
+
+    if logger:
+        logger.info("reports sort fallback failed | final_sort=%s", current_sort or "unknown")
+    return False
+
+
+def _resolve_reports_column_header(page: Page):
+    grid = _resolve_saved_reports_grid(page)
+    if grid.count() == 0:
+        return None
+
+    try:
+        headers = grid.locator("[role='columnheader']")
+        for idx in range(headers.count()):
+            header = headers.nth(idx)
+            text = normalize_report_name(_safe_inner_text(header))
+            if text.startswith("reports"):
+                return header
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
+def _read_sort_state(header) -> str:
+    for candidate in (
+        header,
+        header.locator("xpath=ancestor::*[@aria-sort][1]").first,
+        header.locator("[aria-sort]").first,
+    ):
+        try:
+            if candidate.count() == 0:
+                continue
+            value = (candidate.get_attribute("aria-sort") or "").strip().lower()
+            if value:
+                return value
+        except Exception:  # noqa: BLE001
+            continue
+    return ""
+
+
+def _click_reports_header(header) -> bool:
+    click_targets = [
+        header,
+        header.locator("[role='button']").first,
+        header.locator("button").first,
+        header.locator("span").first,
+    ]
+    for target in click_targets:
+        try:
+            if target.count() == 0:
+                continue
+            target.click(timeout=1800)
+            return True
+        except Exception:  # noqa: BLE001
+            continue
+    return False
 
 
 def _reset_saved_reports_scroll(page: Page) -> None:
@@ -732,3 +980,225 @@ def _is_report_download_ready(page: Page) -> bool:
         except Exception:  # noqa: BLE001
             continue
     return False
+
+
+def _collect_row_lookup_diagnostics(page: Page, item: SavedReportItem) -> dict[str, Any]:
+    sample_names = _sample_saved_report_names(page, limit=12)
+    target_activity = str(item.activity_name or item.activity_key or "").strip().lower()
+    near_names = [
+        name
+        for name in sample_names
+        if (
+            target_activity
+            and target_activity in normalize_report_name(name).replace(" ", "_")
+        )
+        or (item.matched_key and item.matched_key in normalize_report_name(name))
+    ]
+    return {
+        "dom_rows": _saved_reports_data_row_count(page),
+        "aria_rowcount": _extract_grid_aria_rowcount(page),
+        "pagination": _extract_pagination_text(page),
+        "sample_names": sample_names,
+        "near_names": near_names,
+        "url": page.url,
+    }
+
+
+def _build_row_miss_reason(diagnostics: dict[str, Any] | None) -> str:
+    if not diagnostics:
+        return "report row not found in Saved reports table"
+    dom_rows = diagnostics.get("dom_rows")
+    aria_rowcount = diagnostics.get("aria_rowcount")
+    pagination = diagnostics.get("pagination") or "n/a"
+    return (
+        "report row not found in Saved reports table "
+        f"(dom_rows={dom_rows}, aria_rowcount={aria_rowcount or 'n/a'}, pagination={pagination})"
+    )
+
+
+def _log_row_lookup_miss(
+    page: Page,
+    item: SavedReportItem,
+    attempt: int,
+    logger=None,
+    phase: str = "initial",
+    diagnostics: dict[str, Any] | None = None,
+) -> None:
+    if not logger:
+        return
+    details = diagnostics or _collect_row_lookup_diagnostics(page, item)
+    logger.warning(
+        "row lookup miss | phase=%s | attempt=%s | target=%s | activity=%s | expected_name=%s | url=%s | dom_rows=%s | aria_rowcount=%s | pagination=%s | sample_names=%s | near_names=%s",
+        phase,
+        attempt,
+        item.matched_key,
+        item.activity_name or item.activity_key or "-",
+        item.visible_name,
+        details.get("url"),
+        details.get("dom_rows"),
+        details.get("aria_rowcount"),
+        details.get("pagination"),
+        details.get("sample_names"),
+        details.get("near_names"),
+    )
+
+
+def _extract_grid_aria_rowcount(page: Page) -> str:
+    grid = _resolve_saved_reports_grid(page)
+    if grid.count() == 0:
+        return ""
+    try:
+        return (grid.get_attribute("aria-rowcount") or "").strip()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _extract_pagination_text(page: Page) -> str:
+    panel = _resolve_saved_reports_panel(page)
+    try:
+        text_pool = _safe_inner_text(panel if panel.count() > 0 else page)
+    except Exception:  # noqa: BLE001
+        text_pool = ""
+
+    if text_pool:
+        match = PAGINATION_TEXT_REGEX.search(text_pool)
+        if match:
+            return match.group(0)
+    return ""
+
+
+def _sample_saved_report_names(page: Page, limit: int = 12) -> list[str]:
+    names: list[str] = []
+    seen: set[str] = set()
+    locators = (
+        page.locator("[essfield='definition.report_name'] .report-name-text"),
+        page.locator("span.report-name-text"),
+    )
+    for locator in locators:
+        try:
+            count = min(locator.count(), limit * 3)
+        except Exception:  # noqa: BLE001
+            continue
+        for idx in range(count):
+            text = _clean_name_text(_safe_inner_text(locator.nth(idx)))
+            if not text:
+                continue
+            normalized = normalize_report_name(text)
+            if normalized in {"", "reports", "saved reports"}:
+                continue
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            names.append(text)
+            if len(names) >= limit:
+                return names
+    return names
+
+
+def finalize_background_download_results(
+    *,
+    results: list[DownloadResult],
+    lookup_state: dict[str, Any] | None,
+    logger=None,
+) -> list[DownloadResult]:
+    if not results:
+        return results
+    if not isinstance(lookup_state, dict):
+        return results
+
+    pending_map = lookup_state.get("pending_downloads", {})
+    if not isinstance(pending_map, dict):
+        return results
+
+    pending_by_target: dict[str, DownloadResult] = {
+        result.target_key: result
+        for result in results
+        if result.success and (result.reason == PENDING_DOWNLOAD_REASON)
+    }
+    if not pending_by_target:
+        return results
+
+    remaining_targets: list[str] = []
+    for target_key, result in pending_by_target.items():
+        entry = pending_map.get(target_key, {})
+        if not isinstance(entry, dict):
+            result.success = False
+            result.filename = None
+            result.reason = "background download handle missing"
+            remaining_targets.append(target_key)
+            continue
+
+        download_obj = entry.get("download")
+        path_text = str(entry.get("path") or "").strip()
+        if not path_text:
+            result.success = False
+            result.filename = None
+            result.reason = "background download path missing"
+            remaining_targets.append(target_key)
+            continue
+
+        output_path = Path(path_text)
+        try:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            if output_path.exists():
+                output_path.unlink()
+            if download_obj is not None:
+                download_obj.save_as(str(output_path))
+            if output_path.exists() and output_path.stat().st_size > 0:
+                result.filename = output_path.name
+                result.reason = None
+                continue
+            result.success = False
+            result.filename = None
+            result.reason = "background download file missing after save"
+            remaining_targets.append(target_key)
+        except Exception as exc:  # noqa: BLE001
+            result.success = False
+            result.filename = None
+            result.reason = f"background download save failed: {exc}"
+            remaining_targets.append(target_key)
+
+    if logger:
+        logger.info(
+            "background download finalize | pending_initial=%s | pending_remaining=%s",
+            len(pending_by_target),
+            remaining_targets,
+        )
+    return results
+
+
+def _queue_pending_download(
+    *,
+    output_dir: Path,
+    account: AdsAccount,
+    item: SavedReportItem,
+    activity_name: str,
+    lookup_state: dict[str, Any] | None,
+    download_obj,
+    logger=None,
+) -> Path | None:
+    if not isinstance(lookup_state, dict):
+        return None
+    target_key = str(item.matched_key or "").strip()
+    if not target_key:
+        return None
+
+    expected_path = _build_output_path(
+        output_dir=output_dir,
+        account=account,
+        target_key=target_key,
+        activity_name=activity_name,
+    )
+    pending_map = lookup_state.setdefault("pending_downloads", {})
+    if not isinstance(pending_map, dict):
+        return None
+
+    pending_map[target_key] = {
+        "download": download_obj,
+        "path": str(expected_path),
+        "activity_name": str(activity_name or item.activity_name or item.activity_key or "").strip(),
+        "visible_name": item.visible_name,
+    }
+    if logger:
+        logger.info("background download queued target=%s file=%s", target_key, expected_path.name)
+    return expected_path
