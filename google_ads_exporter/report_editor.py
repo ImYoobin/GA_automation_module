@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from playwright.sync_api import Page
 
 from .config import (
@@ -14,6 +16,8 @@ from .config import (
 from .models import AdsAccount
 from .utils import extract_cid
 
+PageReadyCheck = Callable[[Page], bool]
+
 
 def open_report_editor(page: Page, logger=None) -> bool:
     page.goto(REPORT_EDITOR_URL, wait_until="domcontentloaded")
@@ -25,6 +29,15 @@ def open_report_editor(page: Page, logger=None) -> bool:
 
 
 def click_account_in_reporteditor_selector(page: Page, account: AdsAccount, logger=None) -> bool:
+    return click_account_in_selector(page, account, logger=logger, ready_check=is_report_editor_ready)
+
+
+def click_account_in_selector(
+    page: Page,
+    account: AdsAccount,
+    logger=None,
+    ready_check: PageReadyCheck | None = None,
+) -> bool:
     """
     Click the account inside selector surfaces by strict matching priority:
     1) exact CID
@@ -51,10 +64,13 @@ def click_account_in_reporteditor_selector(page: Page, account: AdsAccount, logg
         try:
             target["locator"].click(timeout=4000)
             page.wait_for_timeout(SHORT_WAIT_MS)
-            if _wait_for_selector_close(page) and _wait_for_report_editor_ready(page):
-                return True
+            if _wait_for_selector_close(page):
+                if ready_check is None:
+                    return True
+                if assert_current_account_context(page, account, ready_check=ready_check, logger=logger):
+                    return True
             # Selector may stay in DOM but account still switched.
-            if assert_current_account(page, account, logger=logger):
+            if assert_current_account_context(page, account, ready_check=ready_check, logger=logger):
                 return True
         except Exception as exc:  # noqa: BLE001
             if logger:
@@ -65,34 +81,45 @@ def click_account_in_reporteditor_selector(page: Page, account: AdsAccount, logg
 
 
 def assert_current_account(page: Page, expected: AdsAccount, logger=None) -> bool:
+    return assert_current_account_context(page, expected, ready_check=is_report_editor_ready, logger=logger)
+
+
+def assert_current_account_context(
+    page: Page,
+    expected: AdsAccount,
+    ready_check: PageReadyCheck | None = None,
+    logger=None,
+) -> bool:
     """
     Verify account context with multiple signals.
     Hard signal: expected CID visible.
-    Soft signal: selector closed + report editor/saved reports ready.
+    Soft signal: selector closed + page-specific ready check passed.
     """
     attempts = max(1, int(ACCOUNT_VERIFY_TIMEOUT_MS / 700))
     cid_visible = False
     selector_present = True
-    report_editor_ready = False
+    page_ready = False
     name_visible = False
+    ready_label = getattr(ready_check, "__name__", "page_ready") if ready_check else "page_ready"
 
     for _ in range(attempts):
         cid_visible = _is_expected_cid_visible(page, expected)
         selector_present = account_selector_visible(page)
-        report_editor_ready = is_report_editor_ready(page)
+        page_ready = ready_check(page) if ready_check is not None else True
         name_visible = _is_account_name_visible(page, expected.name)
 
         # Prevent false positive on /nav/selectaccount rows where CID is visible
-        # but report editor context is not established yet.
-        if cid_visible and (report_editor_ready or not selector_present):
+        # but target page context is not established yet.
+        if cid_visible and (page_ready or not selector_present):
             break
 
         # Soft-success path to prevent false retry loops:
-        # account selector is gone and report editor table is ready.
-        if not selector_present and report_editor_ready:
+        # account selector is gone and target page is ready.
+        if not selector_present and page_ready:
             if logger:
                 logger.warning(
-                    "account verification soft-pass | reason=report_editor_ready_without_selector | expected=%s (%s)",
+                    "account verification soft-pass | reason=%s_without_selector | expected=%s (%s)",
+                    ready_label,
                     expected.name,
                     expected.cid,
                 )
@@ -102,16 +129,17 @@ def assert_current_account(page: Page, expected: AdsAccount, logger=None) -> boo
 
     if logger:
         logger.info(
-            "account verification | expected=%s (%s) | verified=%s | cid_visible=%s | selector_present=%s | report_editor_ready=%s | name_visible=%s",
+            "account verification | expected=%s (%s) | verified=%s | cid_visible=%s | selector_present=%s | %s=%s | name_visible=%s",
             expected.name,
             expected.cid,
-            bool(cid_visible and (report_editor_ready or not selector_present)),
+            bool(cid_visible and (page_ready or not selector_present)),
             cid_visible,
             selector_present,
-            report_editor_ready,
+            ready_label,
+            page_ready,
             name_visible,
         )
-    return bool(cid_visible and (report_editor_ready or not selector_present))
+    return bool(cid_visible and (page_ready or not selector_present))
 
 
 def is_report_editor_ready(page: Page) -> bool:

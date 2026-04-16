@@ -1,4 +1,5 @@
-﻿.env
+.env
+.venv/
 *.pem
 *.log
 __pycache__/
@@ -9,5 +10,6 @@ downloads/
 user_data/
 .tmp*/
 tmp*/
+tests/action_log_tests_*/
 dist/
 release/

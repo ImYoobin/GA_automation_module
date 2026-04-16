@@ -7,6 +7,7 @@ import heapq
 import io
 import re
 import subprocess
+from collections.abc import Callable
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -56,6 +57,10 @@ class StreamWriteResult:
     written_rows: int
 
 
+SheetProgressCallback = Callable[[str, str, CsvProcessSummary | None], None]
+TRUEVIEW_VIEWS_COLUMN = "trueview_views"
+
+
 SHEET_POLICIES: tuple[SheetPolicy, ...] = (
     SheetPolicy(
         target_key="campaign_ad_group",
@@ -72,6 +77,7 @@ SHEET_POLICIES: tuple[SheetPolicy, ...] = (
             "Currency code",
             "Cost",
             "Impr.",
+            TRUEVIEW_VIEWS_COLUMN,
             "Unique users",
             "Avg. impr. freq. / user",
             "Clicks",
@@ -157,6 +163,7 @@ SHEET_POLICIES: tuple[SheetPolicy, ...] = (
             "Clicks",
             "Viewable impr.",
             "Impr.",
+            TRUEVIEW_VIEWS_COLUMN,
             "Video played to 25%",
             "Video played to 50%",
             "Video played to 75%",
@@ -180,6 +187,7 @@ SHEET_POLICIES: tuple[SheetPolicy, ...] = (
             "Conversions",
             "Clicks",
             "Impr.",
+            TRUEVIEW_VIEWS_COLUMN,
             "Video played to 25%",
             "Video played to 50%",
             "Video played to 75%",
@@ -249,6 +257,7 @@ SHEET_POLICIES: tuple[SheetPolicy, ...] = (
             "Clicks",
             "Viewable impr.",
             "Impr.",
+            TRUEVIEW_VIEWS_COLUMN,
             "Video played to 25%",
             "Video played to 50%",
             "Video played to 75%",
@@ -283,6 +292,7 @@ SHEET_POLICIES: tuple[SheetPolicy, ...] = (
             "Clicks",
             "Viewable impr.",
             "Impr.",
+            TRUEVIEW_VIEWS_COLUMN,
             "Video played to 25%",
             "Video played to 50%",
             "Video played to 75%",
@@ -306,6 +316,7 @@ SHEET_POLICIES: tuple[SheetPolicy, ...] = (
             "Clicks",
             "Viewable impr.",
             "Impr.",
+            TRUEVIEW_VIEWS_COLUMN,
         ),
         day_policy="raw_only",
     ),
@@ -338,6 +349,7 @@ SHEET_POLICIES: tuple[SheetPolicy, ...] = (
             "Clicks",
             "Viewable impr.",
             "Impr.",
+            TRUEVIEW_VIEWS_COLUMN,
             "Video played to 25%",
             "Video played to 50%",
             "Video played to 75%",
@@ -375,6 +387,7 @@ HEADER_ALIAS_BY_TARGET_TOKEN: dict[str, tuple[str, ...]] = {
     "videoplayedto751": ("video played to 75%",),
     "videoplayedto1001": ("video played to 100%",),
     "allconvvalue": ("conv. value", "conv value"),
+    "trueviewviews": ("trueview_view", "trueview view"),
 }
 
 SCIENTIFIC_NOTATION_REGEX = re.compile(r"^[+-]?(?:\d+(?:\.\d+)?|\.\d+)[eE][+-]?\d+$")
@@ -406,6 +419,7 @@ def create_unified_workbook_for_account(
     output_dir: Path,
     csv_dir: Path | None = None,
     logger=None,
+    progress_callback: SheetProgressCallback | None = None,
 ) -> tuple[Path, list[CsvProcessSummary]]:
     workbook = build_google_template_workbook()
     results_by_key = {result.target_key: result for result in download_results}
@@ -419,6 +433,8 @@ def create_unified_workbook_for_account(
 
         target_display = TARGET_DISPLAY_NAMES.get(target_key, target_key)
         result = results_by_key.get(target_key)
+        if progress_callback is not None:
+            progress_callback(target_key, "start", None)
         summary = _write_target_to_sheet(
             workbook=workbook,
             policy=policy,
@@ -427,6 +443,8 @@ def create_unified_workbook_for_account(
             csv_source_dir=csv_source_dir,
             logger=logger,
         )
+        if progress_callback is not None:
+            progress_callback(target_key, "completed", summary)
         summaries.append(summary)
 
     run_date = datetime.now().strftime("%Y%m%d")
@@ -482,7 +500,9 @@ def summaries_as_rows(
                 "csv_rows": item.csv_rows,
                 "written_rows": item.written_rows,
                 "mapped_columns": len(item.mapped_columns),
-                "missing_columns": len(item.missing_columns),
+                "missing_columns": list(item.missing_columns),
+                "missing_columns_count": len(item.missing_columns),
+                "missing_columns_text": ", ".join(item.missing_columns),
                 "status": item.status,
                 "reason": item.reason or "",
             }

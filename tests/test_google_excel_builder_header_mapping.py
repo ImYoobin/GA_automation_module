@@ -142,8 +142,8 @@ class GoogleExcelBuilderHeaderMappingTests(unittest.TestCase):
                     [
                         "BCG_auto_devices",
                         '"April 13, 2026 - April 13, 2026"',
-                        "Device,Campaign ID,Campaign,Ad group ID,Ad group,Currency code,Cost,Impr.,Clicks,Conversions",
-                        "Mobile phones,111,Test Campaign,222,Test Ad Group,KRW,1000,10,3,1",
+                        "Device,Campaign ID,Campaign,Ad group ID,Ad group,Currency code,Cost,Impr.,Trueview View,Clicks,Conversions",
+                        "Mobile phones,111,Test Campaign,222,Test Ad Group,KRW,1000,10,7,3,1",
                     ]
                 ),
                 encoding="utf-8-sig",
@@ -176,11 +176,112 @@ class GoogleExcelBuilderHeaderMappingTests(unittest.TestCase):
             device_col = headers.index("Device") + 1
             campaign_id_col = headers.index("Campaign ID") + 1
             ad_group_id_col = headers.index("Ad group ID") + 1
+            trueview_view_col = headers.index("trueview_views") + 1
             self.assertEqual(ws.cell(row=2, column=1).value, "2026-04-13")
             self.assertEqual(ws.cell(row=2, column=day_col).value, "2026-04-13")
             self.assertEqual(ws.cell(row=2, column=campaign_id_col).value, "111")
             self.assertEqual(ws.cell(row=2, column=ad_group_id_col).value, "222")
             self.assertEqual(ws.cell(row=2, column=device_col).value, "Mobile phones")
+            self.assertEqual(str(ws.cell(row=2, column=trueview_view_col).value), "7")
+        finally:
+            shutil.rmtree(base, ignore_errors=True)
+
+    def test_create_unified_workbook_emits_sheet_progress_callbacks(self) -> None:
+        base = Path("tests/.tmp_excel_builder_progress")
+        if base.exists():
+            shutil.rmtree(base, ignore_errors=True)
+        try:
+            csv_dir = base / "csv"
+            out_dir = base / "output"
+            csv_dir.mkdir(parents=True, exist_ok=True)
+            out_dir.mkdir(parents=True, exist_ok=True)
+
+            csv_path = csv_dir / "device.csv"
+            csv_path.write_text(
+                "\n".join(
+                    [
+                        "BCG_auto_devices",
+                        '"April 13, 2026 - April 13, 2026"',
+                        "Device,Campaign ID,Campaign,Ad group ID,Ad group,Currency code,Cost,Impr.,Trueview View,Clicks,Conversions",
+                        "Mobile phones,111,Test Campaign,222,Test Ad Group,KRW,1000,10,7,3,1",
+                    ]
+                ),
+                encoding="utf-8-sig",
+            )
+
+            account = AdsAccount(
+                name="Test Account",
+                cid="123-456-7890",
+                cid_digits="1234567890",
+            )
+            events: list[tuple[str, str, object | None]] = []
+
+            create_unified_workbook_for_account(
+                account=account,
+                download_results=[
+                    DownloadResult(
+                        target_key="device",
+                        success=True,
+                        filename=csv_path.name,
+                    )
+                ],
+                activity_name="FCAS",
+                output_dir=out_dir,
+                csv_dir=csv_dir,
+                progress_callback=lambda target_key, stage, summary: events.append((target_key, stage, summary)),
+            )
+
+            device_events = [event for event in events if event[0] == "device"]
+            self.assertEqual([event[1] for event in device_events], ["start", "completed"])
+            self.assertIsNone(device_events[0][2])
+            self.assertEqual(device_events[1][2].sheet_name, "devices")
+        finally:
+            shutil.rmtree(base, ignore_errors=True)
+
+    def test_trueview_views_is_reported_missing_when_absent(self) -> None:
+        base = Path("tests/.tmp_excel_builder_trueview_missing")
+        if base.exists():
+            shutil.rmtree(base, ignore_errors=True)
+        try:
+            csv_dir = base / "csv"
+            out_dir = base / "output"
+            csv_dir.mkdir(parents=True, exist_ok=True)
+            out_dir.mkdir(parents=True, exist_ok=True)
+
+            csv_path = csv_dir / "placements.csv"
+            csv_path.write_text(
+                "\n".join(
+                    [
+                        "BCG_auto_placements",
+                        '"March 31, 2026 - April 13, 2026"',
+                        "Day,Placement (group),Campaign,Campaign ID,Ad group,Ad group ID,Currency code,Cost,Conversions,Clicks,Viewable impr.,Impr.",
+                        "2026-04-13,example.com,Campaign A,111,Group A,222,KRW,100,1,2,10,20",
+                    ]
+                ),
+                encoding="utf-8-sig",
+            )
+
+            account = AdsAccount(
+                name="Test Account",
+                cid="123-456-7890",
+                cid_digits="1234567890",
+            )
+            _workbook_path, summaries = create_unified_workbook_for_account(
+                account=account,
+                download_results=[
+                    DownloadResult(
+                        target_key="placements",
+                        success=True,
+                        filename=csv_path.name,
+                    )
+                ],
+                activity_name="FCAS",
+                output_dir=out_dir,
+                csv_dir=csv_dir,
+            )
+
+            placements_summary = next(item for item in summaries if item.target_key == "placements")
+            self.assertIn("trueview_views", placements_summary.missing_columns)
         finally:
             shutil.rmtree(base, ignore_errors=True)
 

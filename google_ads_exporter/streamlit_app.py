@@ -18,15 +18,16 @@ import streamlit as st
 from google_ads_exporter.env import load_env_file
 from google_ads_exporter.execution_service import (
     AccountStageRow,
+    ActionLogRow,
     LogRow,
     create_execution_store,
     start_export_execution,
 )
+from google_ads_exporter.action_log_downloader import build_action_log_run_dir
 from google_ads_exporter.google_adapter import (
     login_and_crawl_accounts_in_subprocess,
     run_scan_and_export_in_subprocess,
 )
-from google_ads_exporter.google_excel_builder import open_file_in_explorer
 from google_ads_exporter.main import _apply_runtime_directory_overrides, _default_target_map_path
 from google_ads_exporter.models import AdsAccount
 from google_ads_exporter.utils import setup_logger
@@ -48,23 +49,18 @@ STATUS_STYLE = {
 }
 
 RUNTIME_SETTINGS_RELATIVE_PATH = Path("config") / "runtime_settings.json"
-RUNTIME_PATH_KEYS: tuple[str, ...] = ("output_dir", "downloads_dir", "logs_dir")
-RUNTIME_INPUT_KEY_BY_PATH_KEY: dict[str, str] = {
-    "output_dir": "output_dir_input",
-    "downloads_dir": "downloads_dir_input",
-    "logs_dir": "logs_dir_input",
-}
-DEFAULT_USER_BASE_DIR = Path.home() / "GoogleAdsExport"
-DEFAULT_USER_OUTPUT_DIR = DEFAULT_USER_BASE_DIR / "output"
-DEFAULT_USER_DOWNLOADS_DIR = DEFAULT_USER_BASE_DIR / "downloads"
-DEFAULT_USER_LOGS_DIR = DEFAULT_USER_BASE_DIR / "logs"
-INVALID_RUNTIME_PATH_MESSAGE = "올바르지 않은 경로입니다. 로컬 PC 경로를 입력해주세요."
+LEGACY_RUNTIME_PATH_KEYS: tuple[str, ...] = ("output_dir", "downloads_dir", "logs_dir")
+BASE_PARENT_INPUT_KEY = "base_parent_dir_input"
+EXPORT_ROOT_DIRNAME = "GoogleAdsExport"
+DEFAULT_USER_PARENT_DIR = Path.home()
+DEFAULT_USER_PARENT_DIR_TOKEN = "%USERPROFILE%"
+INVALID_RUNTIME_PATH_MESSAGE = "올바르지 않은 부모 경로입니다. 로컬 PC의 폴더 경로를 입력해주세요."
 _WINDOWS_ABS_DRIVE_RE = re.compile(r"^[A-Za-z]:\\")
 _WINDOWS_DRIVE_TOKEN_RE = re.compile(r"[A-Za-z]:\\")
 
 
 def run_streamlit_app() -> None:
-    st.set_page_config(page_title="Google Ads Exporter", layout="wide")
+    st.set_page_config(page_title="Google Ads Auto Download", layout="wide")
     _init_session_state()
     _inject_ui_css()
 
@@ -77,11 +73,13 @@ def run_streamlit_app() -> None:
     snapshot = store.snapshot()
 
     _open_output_folder_for_completed_run(snapshot)
+    _apply_ready_login_result(snapshot)
 
-    st.title("Google Ads Auto Export")
-    st.markdown("📋 상단에서 Export할 Account를 선택합니다. Report Editor에 Report를 사전 세팅해주세요.")
-    st.markdown("📊 하단에서 매칭 결과, 실행 로그, 처리 완료 요약을 확인합니다.")
-    st.markdown("⚙️ 좌측 사이드바에서 Run Settings를 설정합니다.")
+    st.title("Google Ads Auto Download")
+    st.markdown(
+        "광고계정에 미리 리포트/뷰를 세팅해주세요.<br>'BCG_auto_리포트/뷰이름_액티비티' 이름을 기준으로 감지합니다.",
+        unsafe_allow_html=True,
+    )
 
     _render_sidebar_execution_section(snapshot)
     runtime_path_error = _safe_text(st.session_state.pop("_runtime_path_error", ""))
@@ -89,7 +87,6 @@ def run_streamlit_app() -> None:
         st.warning(runtime_path_error)
     _persist_runtime_settings(force=bool(st.session_state.get("_runtime_settings_needs_heal")))
 
-    _render_step_header("📋 Export할 Account 선택하기")
     _render_account_selection_flow(snapshot)
 
     _render_step_header("📊 진행 상황")
@@ -113,10 +110,68 @@ def _safe_path(path_text: str) -> Path:
 def _default_runtime_settings() -> dict[str, str]:
     return {
         "browser": "msedge",
-        "output_dir": str(DEFAULT_USER_OUTPUT_DIR),
-        "downloads_dir": str(DEFAULT_USER_DOWNLOADS_DIR),
-        "logs_dir": str(DEFAULT_USER_LOGS_DIR),
+        "base_parent_dir": DEFAULT_USER_PARENT_DIR_TOKEN,
     }
+
+
+def _current_run_date_token() -> str:
+    return _safe_text(st.session_state.get("run_date_folder")) or dt.datetime.now().strftime("%Y%m%d")
+
+
+def _build_storage_roots(base_parent_dir_text: str = "") -> dict[str, Path]:
+    parent_dir = _safe_path(
+        _safe_text(base_parent_dir_text)
+        or _safe_text(st.session_state.get("base_parent_dir"))
+        or str(DEFAULT_USER_PARENT_DIR)
+    )
+    export_root = (parent_dir / EXPORT_ROOT_DIRNAME).resolve()
+    output_root = (export_root / "output").resolve()
+    return {
+        "base": export_root,
+        "raw_root": (export_root / "raw").resolve(),
+        "trace_root": (export_root / "trace").resolve(),
+        "output_root": output_root,
+        "action_log_root": (output_root / "action_log").resolve(),
+    }
+
+
+def _build_run_storage_paths(base_parent_dir_text: str = "", run_date: str = "") -> dict[str, Path]:
+    roots = _build_storage_roots(base_parent_dir_text)
+    effective_run_date = _safe_text(run_date) or _current_run_date_token()
+    return {
+        "run_date": effective_run_date,
+        "base": roots["base"],
+        "raw_root": roots["raw_root"],
+        "trace_root": roots["trace_root"],
+        "output_root": roots["output_root"],
+        "action_log_root": roots["action_log_root"],
+        "raw_dir": (roots["raw_root"] / effective_run_date).resolve(),
+        "trace_dir": (roots["trace_root"] / effective_run_date).resolve(),
+        "output_dir": (roots["output_root"] / effective_run_date).resolve(),
+        "action_log_dir": build_action_log_run_dir(roots["output_root"], effective_run_date),
+    }
+
+
+def _serialize_base_parent_dir_for_settings(base_parent_dir_text: str) -> str:
+    normalized = _safe_path(base_parent_dir_text)
+    if normalized == DEFAULT_USER_PARENT_DIR.resolve():
+        return DEFAULT_USER_PARENT_DIR_TOKEN
+    return str(normalized)
+
+
+def _infer_base_parent_dir_from_legacy_settings(runtime_settings: dict[str, str]) -> str:
+    for key in LEGACY_RUNTIME_PATH_KEYS:
+        raw_value = _safe_text(runtime_settings.get(key))
+        if not raw_value:
+            continue
+        try:
+            candidate_path = _safe_path(raw_value)
+        except Exception:  # noqa: BLE001
+            continue
+        for ancestor in (candidate_path, *candidate_path.parents):
+            if ancestor.name.lower() == EXPORT_ROOT_DIRNAME.lower():
+                return str(ancestor.parent)
+    return ""
 
 
 def _validate_runtime_path(value: Any, *, check_writable: bool) -> tuple[bool, str]:
@@ -161,8 +216,10 @@ def _validate_runtime_path(value: Any, *, check_writable: bool) -> tuple[bool, s
 
 
 def _sanitize_loaded_runtime_settings(runtime_settings: dict[str, str]) -> tuple[dict[str, str], bool]:
-    defaults = _default_runtime_settings()
-    sanitized = dict(defaults)
+    sanitized = {
+        "browser": "msedge",
+        "base_parent_dir": str(DEFAULT_USER_PARENT_DIR),
+    }
     has_invalid = False
 
     raw_browser = _safe_text(runtime_settings.get("browser")).lower()
@@ -172,17 +229,17 @@ def _sanitize_loaded_runtime_settings(runtime_settings: dict[str, str]) -> tuple
         else:
             has_invalid = True
 
-    for path_key in RUNTIME_PATH_KEYS:
-        raw_value = _safe_text(runtime_settings.get(path_key))
-        if not raw_value:
-            if path_key in runtime_settings:
-                has_invalid = True
-            continue
-        is_valid, normalized_or_message = _validate_runtime_path(raw_value, check_writable=False)
+    raw_parent_dir = _safe_text(runtime_settings.get("base_parent_dir")) or _infer_base_parent_dir_from_legacy_settings(
+        runtime_settings
+    )
+    if raw_parent_dir:
+        is_valid, normalized_or_message = _validate_runtime_path(raw_parent_dir, check_writable=False)
         if is_valid:
-            sanitized[path_key] = normalized_or_message
+            sanitized["base_parent_dir"] = normalized_or_message
         else:
             has_invalid = True
+    elif any(_safe_text(runtime_settings.get(key)) for key in LEGACY_RUNTIME_PATH_KEYS):
+        has_invalid = True
 
     return sanitized, has_invalid
 
@@ -191,52 +248,35 @@ def _push_runtime_path_warning() -> None:
     st.session_state["_runtime_path_error"] = INVALID_RUNTIME_PATH_MESSAGE
 
 
-def _on_runtime_path_input_change(path_key: str) -> None:
-    input_key = RUNTIME_INPUT_KEY_BY_PATH_KEY[path_key]
-    candidate = _safe_text(st.session_state.get(input_key))
+def _on_base_parent_dir_input_change() -> None:
+    candidate = _safe_text(st.session_state.get(BASE_PARENT_INPUT_KEY))
     is_valid, normalized_or_message = _validate_runtime_path(candidate, check_writable=False)
     if is_valid:
-        st.session_state[path_key] = normalized_or_message
-        st.session_state[f"_runtime_valid_{path_key}"] = normalized_or_message
+        st.session_state["base_parent_dir"] = normalized_or_message
+        st.session_state["_runtime_valid_base_parent_dir"] = normalized_or_message
+        st.session_state[BASE_PARENT_INPUT_KEY] = normalized_or_message
         return
 
-    fallback = _safe_text(st.session_state.get(f"_runtime_valid_{path_key}"))
+    fallback = _safe_text(st.session_state.get("_runtime_valid_base_parent_dir"))
     if not fallback:
-        fallback = _default_runtime_settings()[path_key]
-    st.session_state[path_key] = fallback
-    st.session_state[f"_runtime_valid_{path_key}"] = fallback
+        fallback = str(DEFAULT_USER_PARENT_DIR)
+    st.session_state["base_parent_dir"] = fallback
+    st.session_state["_runtime_valid_base_parent_dir"] = fallback
+    st.session_state[BASE_PARENT_INPUT_KEY] = fallback
     _push_runtime_path_warning()
 
-
-def _on_output_dir_input_change() -> None:
-    _on_runtime_path_input_change("output_dir")
-
-
-def _on_downloads_dir_input_change() -> None:
-    _on_runtime_path_input_change("downloads_dir")
-
-
-def _on_logs_dir_input_change() -> None:
-    _on_runtime_path_input_change("logs_dir")
-
-
 def _validate_runtime_paths_before_run() -> tuple[bool, dict[str, str]]:
-    normalized_paths: dict[str, str] = {}
-    for path_key in RUNTIME_PATH_KEYS:
-        is_valid, normalized_or_message = _validate_runtime_path(
-            st.session_state.get(path_key),
-            check_writable=True,
-        )
-        if not is_valid:
-            _push_runtime_path_warning()
-            return False, {}
-        normalized_paths[path_key] = normalized_or_message
+    is_valid, normalized_or_message = _validate_runtime_path(
+        st.session_state.get("base_parent_dir"),
+        check_writable=True,
+    )
+    if not is_valid:
+        _push_runtime_path_warning()
+        return False, {}
 
-    for path_key, normalized in normalized_paths.items():
-        st.session_state[path_key] = normalized
-        st.session_state[f"_runtime_valid_{path_key}"] = normalized
-
-    return True, normalized_paths
+    st.session_state["base_parent_dir"] = normalized_or_message
+    st.session_state["_runtime_valid_base_parent_dir"] = normalized_or_message
+    return True, {"base_parent_dir": normalized_or_message}
 
 
 def _app_base_dir() -> Path:
@@ -259,6 +299,106 @@ def _now_run_id() -> str:
     return dt.datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
+def _account_to_payload(account: AdsAccount) -> dict[str, Any]:
+    return {
+        "name": account.name,
+        "cid": account.cid,
+        "cid_digits": account.cid_digits,
+        "is_manager": account.is_manager,
+        "raw_text": account.raw_text,
+    }
+
+
+def _accounts_from_payload(payloads: list[dict[str, Any]]) -> list[AdsAccount]:
+    accounts: list[AdsAccount] = []
+    for item in payloads:
+        if not isinstance(item, dict):
+            continue
+        cid = _safe_text(item.get("cid"))
+        cid_digits = _safe_text(item.get("cid_digits"))
+        if not cid or not cid_digits:
+            continue
+        accounts.append(
+            AdsAccount(
+                name=_safe_text(item.get("name")) or cid,
+                cid=cid,
+                cid_digits=cid_digits,
+                is_manager=bool(item.get("is_manager")),
+                raw_text=_safe_text(item.get("raw_text")),
+            )
+        )
+    return accounts
+
+
+def _run_login_and_crawl_background(
+    *,
+    browser: str,
+    headless: bool,
+    target_map_path: str,
+    progress_cb,
+) -> None:
+    accounts, browser_used, worker_log_file = login_and_crawl_accounts_in_subprocess(
+        browser=browser,
+        headless=headless,
+        target_map_path=target_map_path,
+        progress_cb=progress_cb,
+    )
+    progress_cb(
+        {
+            "type": "login_accounts_ready",
+            "accounts": [_account_to_payload(account) for account in accounts],
+            "browser_used": browser_used,
+            "log_file": worker_log_file,
+        }
+    )
+    progress_cb({"type": "scan_results", "rows": []})
+    progress_cb(
+        {
+            "type": "run_completed",
+            "run_status": "Ready",
+            "message": f"Account crawl completed: {len(accounts)}",
+        }
+    )
+    if worker_log_file:
+        progress_cb(
+            {
+                "type": "run_warning",
+                "message": f"로그 파일 확인: {worker_log_file}",
+            }
+        )
+
+
+def _apply_ready_login_result(snapshot: dict[str, Any]) -> None:
+    run_id = _safe_text(snapshot.get("run_id"))
+    if not run_id:
+        return
+    if _safe_text(st.session_state.get("applied_login_result_run_id")) == run_id:
+        return
+    payloads = snapshot.get("login_accounts_payload")
+    if not isinstance(payloads, list) or not payloads:
+        return
+
+    st.session_state["accounts"] = _accounts_from_payload(payloads)
+    st.session_state["selected_cids"] = set()
+    st.session_state["scan_results"] = {}
+    st.session_state["matching_ready"] = False
+    st.session_state["started"] = True
+    st.session_state["opened_output_for_run"] = ""
+    st.session_state["validated_output_count_run"] = ""
+    st.session_state["expected_output_count"] = 0
+    st.session_state["applied_login_result_run_id"] = run_id
+
+
+def _login_progress_helper_text(snapshot: dict[str, Any]) -> str:
+    if (not bool(snapshot.get("is_running"))) or (_safe_text(snapshot.get("run_status")).lower() != "preparing"):
+        return ""
+
+    login_status = _safe_text(snapshot.get("login_status")).lower()
+    if login_status == "crawling accounts":
+        return "계정 크롤링중입니다."
+    return "로그인 대기중입니다."
+
+
 def _runtime_settings_path(base_dir: Path) -> Path:
     return (base_dir / RUNTIME_SETTINGS_RELATIVE_PATH).resolve()
 
@@ -275,7 +415,7 @@ def _load_runtime_settings(base_dir: Path) -> dict[str, str]:
         return {}
 
     out: dict[str, str] = {}
-    for key in ("browser", "output_dir", "downloads_dir", "logs_dir"):
+    for key in ("browser", "base_parent_dir", "output_dir", "downloads_dir", "logs_dir"):
         value = _safe_text(parsed.get(key))
         if value:
             out[key] = value
@@ -290,9 +430,9 @@ def _runtime_settings_payload(base_dir: Path) -> dict[str, str]:
         browser = defaults["browser"]
     return {
         "browser": browser,
-        "output_dir": _safe_text(st.session_state.get("output_dir")) or defaults["output_dir"],
-        "downloads_dir": _safe_text(st.session_state.get("downloads_dir")) or defaults["downloads_dir"],
-        "logs_dir": _safe_text(st.session_state.get("logs_dir")) or defaults["logs_dir"],
+        "base_parent_dir": _serialize_base_parent_dir_for_settings(
+            _safe_text(st.session_state.get("base_parent_dir")) or str(DEFAULT_USER_PARENT_DIR)
+        ),
     }
 
 
@@ -382,12 +522,21 @@ def _init_session_state() -> None:
     st.session_state.setdefault("scan_results", {})
     st.session_state.setdefault("matching_ready", False)
     st.session_state.setdefault("started", False)
+    st.session_state.setdefault("applied_login_result_run_id", "")
+    st.session_state.setdefault("enable_report_download", True)
+    st.session_state.setdefault("enable_action_log_download", True)
+    st.session_state.setdefault("run_enable_report_download", True)
+    st.session_state.setdefault("run_enable_action_log_download", True)
     st.session_state.setdefault("opened_output_for_run", "")
     st.session_state.setdefault("validated_output_count_run", "")
     st.session_state.setdefault("expected_output_count", 0)
+    st.session_state.setdefault("run_output_root_dir", "")
+    st.session_state.setdefault("run_raw_dir", "")
+    st.session_state.setdefault("run_trace_dir", "")
     st.session_state.setdefault("run_output_dir", "")
     st.session_state.setdefault("run_downloads_dir", "")
     st.session_state.setdefault("run_logs_dir", "")
+    st.session_state.setdefault("run_action_log_dir", "")
     st.session_state.setdefault("run_date_folder", "")
     st.session_state.setdefault("_runtime_settings_needs_heal", False)
     st.session_state.setdefault("_runtime_path_error", "")
@@ -416,35 +565,23 @@ def _init_session_state() -> None:
         _safe_text(os.getenv("GOOGLE_ADS_USER_DATA_DIR", "")),
     )
     st.session_state.setdefault(
-        "downloads_dir",
-        runtime_settings.get("downloads_dir")
-        or _safe_text(os.getenv("GOOGLE_ADS_OUTPUT_DIR", str(DEFAULT_USER_DOWNLOADS_DIR))),
-    )
-    st.session_state.setdefault(
-        "output_dir",
-        runtime_settings.get("output_dir") or str(DEFAULT_USER_OUTPUT_DIR),
-    )
-    st.session_state.setdefault(
-        "logs_dir",
-        runtime_settings.get("logs_dir")
-        or _safe_text(os.getenv("GOOGLE_ADS_LOGS_DIR", str(DEFAULT_USER_LOGS_DIR))),
+        "base_parent_dir",
+        runtime_settings.get("base_parent_dir") or str(DEFAULT_USER_PARENT_DIR),
     )
 
-    for path_key in RUNTIME_PATH_KEYS:
-        is_valid, normalized_or_message = _validate_runtime_path(
-            st.session_state.get(path_key),
-            check_writable=False,
-        )
-        if not is_valid:
-            normalized = runtime_settings[path_key]
-            st.session_state["_runtime_settings_needs_heal"] = True
-            st.session_state["_runtime_path_error"] = INVALID_RUNTIME_PATH_MESSAGE
-        else:
-            normalized = normalized_or_message
-        st.session_state[path_key] = normalized
-        st.session_state[f"_runtime_valid_{path_key}"] = normalized
-        input_key = RUNTIME_INPUT_KEY_BY_PATH_KEY[path_key]
-        st.session_state.setdefault(input_key, normalized)
+    is_valid, normalized_or_message = _validate_runtime_path(
+        st.session_state.get("base_parent_dir"),
+        check_writable=False,
+    )
+    if not is_valid:
+        normalized = runtime_settings.get("base_parent_dir") or str(DEFAULT_USER_PARENT_DIR)
+        st.session_state["_runtime_settings_needs_heal"] = True
+        st.session_state["_runtime_path_error"] = INVALID_RUNTIME_PATH_MESSAGE
+    else:
+        normalized = normalized_or_message
+    st.session_state["base_parent_dir"] = normalized
+    st.session_state["_runtime_valid_base_parent_dir"] = normalized
+    st.session_state.setdefault(BASE_PARENT_INPUT_KEY, normalized)
 
     st.session_state.setdefault(
         "_runtime_settings_last_saved",
@@ -464,21 +601,7 @@ def _render_sidebar_execution_section(snapshot: dict[str, Any]) -> None:
             options=browser_options,
             index=browser_options.index(current_browser),
         )
-        st.text_input(
-            "결과 저장 경로",
-            key=RUNTIME_INPUT_KEY_BY_PATH_KEY["output_dir"],
-            on_change=_on_output_dir_input_change,
-        )
-        st.text_input(
-            "다운로드 경로",
-            key=RUNTIME_INPUT_KEY_BY_PATH_KEY["downloads_dir"],
-            on_change=_on_downloads_dir_input_change,
-        )
-        st.text_input(
-            "로그 경로",
-            key=RUNTIME_INPUT_KEY_BY_PATH_KEY["logs_dir"],
-            on_change=_on_logs_dir_input_change,
-        )
+        st.text_input("저장 부모 경로", key=BASE_PARENT_INPUT_KEY, on_change=_on_base_parent_dir_input_change)
         if bool(snapshot.get("is_running")):
             st.info("실행 중입니다...")
 
@@ -501,12 +624,13 @@ def _render_account_selection_flow(snapshot: dict[str, Any]) -> None:
 def _render_main_login_section(snapshot: dict[str, Any]) -> None:
     is_running = bool(snapshot.get("is_running"))
     account_count = len(st.session_state.get("accounts", []))
+    login_helper_text = _login_progress_helper_text(snapshot)
 
     cols = st.columns([4.3, 1.2], vertical_alignment="center")
     with cols[0]:
         st.markdown("<div class='ga-main-card-title'>Google Ads 로그인</div>", unsafe_allow_html=True)
         st.markdown(
-            "<p class='ga-caption-muted'>로그인하면 계정목록을 선택할 수 있습니다.</p>",
+            "<p class='ga-caption-muted'>Google Ads에 로그인하면 등록된 광고계정을 불러옵니다.</p>",
             unsafe_allow_html=True,
         )
         if account_count > 0:
@@ -522,66 +646,76 @@ def _render_main_login_section(snapshot: dict[str, Any]) -> None:
             width="stretch",
             key="main_start_btn",
         ):
-            with st.spinner("Google Ads 로그인 확인 및 계정 크롤링 중입니다..."):
-                _handle_start()
+            _handle_start()
             st.rerun()
+        if login_helper_text:
+            st.markdown(
+                f"<p class='ga-caption-muted'>{login_helper_text}</p>",
+                unsafe_allow_html=True,
+            )
 
 
 def _render_account_export_section(snapshot: dict[str, Any]) -> None:
-    st.markdown("<div class='ga-main-card-title'>Account 선택</div>", unsafe_allow_html=True)
+    st.markdown("<div class='ga-main-card-title'>광고계정 선택</div>", unsafe_allow_html=True)
     st.markdown(
-        "<p class='ga-caption-muted'>선택한 계정에서 사전 세팅된 Report를 매칭해 다운로드합니다.</p>",
+        (
+            "<p class='ga-caption-muted'>선택한 계정의 Saved reports에서 액티비티를 감지해서 "
+            "캠페인 데이터/액션 로그를 다운로드합니다.</p>"
+        ),
         unsafe_allow_html=True,
     )
     _render_account_selector(snapshot)
+    _render_execution_options(snapshot)
     _render_proceed_export(snapshot)
 
 
 def _prepare_run_directories() -> dict[str, str]:
     run_date = dt.datetime.now().strftime("%Y%m%d")
-    output_base = _safe_path(_safe_text(st.session_state.get("output_dir")))
-    downloads_base = _safe_path(_safe_text(st.session_state.get("downloads_dir")))
-    logs_base = _safe_path(_safe_text(st.session_state.get("logs_dir")))
-
-    # Keep runtime paths relative to each configured base directory:
-    # output/<YYYYMMDD>, downloads/<YYYYMMDD>, logs/<YYYYMMDD>
-    run_output_dir = (output_base / run_date).resolve()
-    run_downloads_dir = (downloads_base / run_date).resolve()
-    run_logs_dir = (logs_base / run_date).resolve()
+    run_paths = _build_run_storage_paths(run_date=run_date)
+    run_output_dir = run_paths["output_dir"]
+    run_raw_dir = run_paths["raw_dir"]
+    run_trace_dir = run_paths["trace_dir"]
+    run_action_log_dir = run_paths["action_log_dir"]
 
     run_output_dir.mkdir(parents=True, exist_ok=True)
-    run_downloads_dir.mkdir(parents=True, exist_ok=True)
-    run_logs_dir.mkdir(parents=True, exist_ok=True)
+    run_raw_dir.mkdir(parents=True, exist_ok=True)
+    run_trace_dir.mkdir(parents=True, exist_ok=True)
 
+    st.session_state["run_output_root_dir"] = str(run_paths["output_root"])
     st.session_state["run_output_dir"] = str(run_output_dir)
-    st.session_state["run_downloads_dir"] = str(run_downloads_dir)
-    st.session_state["run_logs_dir"] = str(run_logs_dir)
+    st.session_state["run_raw_dir"] = str(run_raw_dir)
+    st.session_state["run_trace_dir"] = str(run_trace_dir)
+    st.session_state["run_downloads_dir"] = str(run_raw_dir)
+    st.session_state["run_logs_dir"] = str(run_trace_dir)
+    st.session_state["run_action_log_dir"] = str(run_action_log_dir)
     st.session_state["run_date_folder"] = run_date
 
     return {
         "run_date": run_date,
         "output_dir": str(run_output_dir),
-        "downloads_dir": str(run_downloads_dir),
-        "logs_dir": str(run_logs_dir),
+        "output_root_dir": str(run_paths["output_root"]),
+        "raw_dir": str(run_raw_dir),
+        "trace_dir": str(run_trace_dir),
+        "action_log_dir": str(run_action_log_dir),
     }
 
 
 def _apply_runtime_settings(
     *,
-    downloads_dir_override: str = "",
-    logs_dir_override: str = "",
+    output_dir_override: str = "",
+    trace_dir_override: str = "",
 ) -> None:
     env_file = _safe_text(st.session_state.get("env_file"))
     if env_file:
         load_env_file(env_file)
 
-    downloads_dir = _safe_text(downloads_dir_override) or _safe_text(st.session_state.get("downloads_dir"))
-    logs_dir = _safe_text(logs_dir_override) or _safe_text(st.session_state.get("logs_dir"))
+    output_dir = _safe_text(output_dir_override) or str(_build_storage_roots()["output_root"])
+    trace_dir = _safe_text(trace_dir_override) or str(_build_storage_roots()["trace_root"])
 
     _apply_runtime_directory_overrides(
         runtime_dir=_safe_text(st.session_state.get("runtime_dir")),
-        output_dir=downloads_dir,
-        logs_dir=logs_dir,
+        output_dir=output_dir,
+        logs_dir=trace_dir,
         user_data_dir=_safe_text(st.session_state.get("user_data_dir")),
     )
 
@@ -611,10 +745,20 @@ def _handle_start() -> None:
 
     run_dirs = _prepare_run_directories()
     _apply_runtime_settings(
-        downloads_dir_override=run_dirs["downloads_dir"],
-        logs_dir_override=run_dirs["logs_dir"],
+        output_dir_override=run_dirs["output_dir"],
+        trace_dir_override=run_dirs["trace_dir"],
     )
-    _logger, log_path = setup_logger("google_ads_exporter.streamlit")
+    logger, log_path = setup_logger("google_ads_exporter.streamlit")
+    st.session_state["accounts"] = []
+    st.session_state["selected_cids"] = set()
+    st.session_state["scan_results"] = {}
+    st.session_state["matching_ready"] = False
+    st.session_state["started"] = False
+    st.session_state["opened_output_for_run"] = ""
+    st.session_state["validated_output_count_run"] = ""
+    st.session_state["expected_output_count"] = 0
+    st.session_state["applied_login_result_run_id"] = ""
+    store.push_event({"type": "scan_results", "rows": []})
     store.push_event(
         {
             "type": "run_started",
@@ -625,50 +769,30 @@ def _handle_start() -> None:
     )
 
     try:
-        accounts, _browser_used, worker_log_file = login_and_crawl_accounts_in_subprocess(
-            browser=_safe_text(st.session_state.get("browser")) or "msedge",
-            headless=False,
-            target_map_path=_safe_text(st.session_state.get("target_map_path")),
-            progress_cb=store.push_event,
+        ok, message = start_export_execution(
+            store=store,
+            runner=_run_login_and_crawl_background,
+            runner_kwargs={
+                "browser": _safe_text(st.session_state.get("browser")) or "msedge",
+                "headless": False,
+                "target_map_path": _safe_text(st.session_state.get("target_map_path")),
+            },
         )
-        st.session_state["accounts"] = accounts
-        st.session_state["selected_cids"] = set()
-        st.session_state["scan_results"] = {}
-        st.session_state["matching_ready"] = False
-        st.session_state["started"] = True
-        st.session_state["opened_output_for_run"] = ""
-        st.session_state["validated_output_count_run"] = ""
-        st.session_state["expected_output_count"] = 0
-        store.push_event({"type": "scan_results", "rows": []})
-
-        store.push_event(
-            {
-                "type": "run_completed",
-                "run_status": "Ready",
-                "message": f"Account crawl completed: {len(accounts)}",
-            }
-        )
-        if worker_log_file:
+        if not ok:
             store.push_event(
                 {
                     "type": "run_warning",
-                    "message": f"로그 파일 확인: {worker_log_file}",
+                    "message": message,
                 }
             )
     except Exception as exc:  # noqa: BLE001
         error_text = _exc_text(exc)
-        _logger.exception("start flow failed: %s", error_text)
+        logger.exception("start flow failed: %s", error_text)
         st.session_state["started"] = False
         store.push_event(
             {
                 "type": "run_failed",
                 "error": f"Start failed: {error_text}",
-            }
-        )
-        store.push_event(
-            {
-                "type": "run_warning",
-                "message": f"로그 파일 확인: {log_path}",
             }
         )
 
@@ -708,10 +832,10 @@ def _render_account_selector(snapshot: dict[str, Any]) -> None:
         width="stretch",
         hide_index=True,
         column_config={
-            "export": st.column_config.CheckboxColumn("Export", default=False),
-            "account_name": st.column_config.TextColumn("Account"),
+            "export": st.column_config.CheckboxColumn("선택", default=False),
+            "account_name": st.column_config.TextColumn("광고계정"),
             "cid": st.column_config.TextColumn("CID"),
-            "is_manager": st.column_config.CheckboxColumn("Manager", disabled=True),
+            "is_manager": st.column_config.CheckboxColumn("매니저", disabled=True),
             "cid_digits": None,
         },
         disabled=["account_name", "cid", "is_manager", "cid_digits"],
@@ -729,31 +853,57 @@ def _render_account_selector(snapshot: dict[str, Any]) -> None:
         st.session_state["opened_output_for_run"] = ""
         st.session_state["validated_output_count_run"] = ""
         st.session_state["expected_output_count"] = 0
+        st.session_state["run_action_log_dir"] = ""
         st.session_state["execution_store"].push_event({"type": "scan_results", "rows": []})
 
     st.session_state["selected_cids"] = new_selected
-    st.caption(f"Selected accounts: {len(new_selected)}")
+    st.caption(f"선택한 광고계정: {len(new_selected)}")
+
+
+def _execution_modes_enabled() -> tuple[bool, bool]:
+    return (
+        bool(st.session_state.get("enable_report_download", True)),
+        bool(st.session_state.get("enable_action_log_download", True)),
+    )
+
+
+def _render_execution_options(snapshot: dict[str, Any]) -> None:
+    del snapshot
+    st.markdown("<div class='ga-main-card-title'>실행 옵션</div>", unsafe_allow_html=True)
+    cols = st.columns(2)
+    with cols[0]:
+        st.checkbox("캠페인 데이터 다운로드", key="enable_report_download")
+    with cols[1]:
+        st.checkbox("액션 로그 다운로드", key="enable_action_log_download")
+    report_enabled, action_log_enabled = _execution_modes_enabled()
+    if not report_enabled and not action_log_enabled:
+        st.markdown(
+            "<div class='ga-disabled-box'>최소 한 개의 실행 항목을 선택해야 합니다.</div>",
+            unsafe_allow_html=True,
+        )
 
 
 def _render_proceed_export(snapshot: dict[str, Any]) -> None:
+    report_enabled, action_log_enabled = _execution_modes_enabled()
     disabled = (
         bool(snapshot.get("is_running"))
         or (not st.session_state.get("started", False))
         or (len(_selected_accounts()) == 0)
+        or (not report_enabled and not action_log_enabled)
     )
     if st.session_state.get("started", False) and len(_selected_accounts()) == 0:
         st.markdown(
-            "<div class='ga-disabled-box'>계정을 선택하면 Export하기가 활성화됩니다.</div>",
+            "<div class='ga-disabled-box'>광고계정을 선택하면 다운로드하기가 활성화됩니다.</div>",
             unsafe_allow_html=True,
         )
     if st.button(
-        "Export하기",
+        "다운로드하기",
         type="primary",
         width="stretch",
         disabled=disabled,
         key="proceed_export_btn",
     ):
-        with st.spinner("매칭 후 Export를 시작합니다..."):
+        with st.spinner("매칭 후 실행을 시작합니다..."):
             _handle_start_export()
         st.rerun()
 
@@ -761,6 +911,10 @@ def _render_proceed_export(snapshot: dict[str, Any]) -> None:
 def _handle_start_export() -> None:
     store = st.session_state["execution_store"]
     if store.is_running():
+        return
+
+    report_enabled, action_log_enabled = _execution_modes_enabled()
+    if not report_enabled and not action_log_enabled:
         return
 
     selected_accounts = _selected_accounts()
@@ -779,8 +933,8 @@ def _handle_start_export() -> None:
 
     run_dirs = _prepare_run_directories()
     _apply_runtime_settings(
-        downloads_dir_override=run_dirs["downloads_dir"],
-        logs_dir_override=run_dirs["logs_dir"],
+        output_dir_override=run_dirs["output_dir"],
+        trace_dir_override=run_dirs["trace_dir"],
     )
     logger, log_path = setup_logger("google_ads_exporter.streamlit")
 
@@ -788,6 +942,8 @@ def _handle_start_export() -> None:
     st.session_state["opened_output_for_run"] = ""
     st.session_state["validated_output_count_run"] = ""
     st.session_state["matching_ready"] = False
+    st.session_state["run_enable_report_download"] = report_enabled
+    st.session_state["run_enable_action_log_download"] = action_log_enabled
 
     store.initialize_rows(selected_accounts)
     store.push_event(
@@ -808,7 +964,10 @@ def _handle_start_export() -> None:
             "headless": False,
             "target_map_path": _safe_text(st.session_state.get("target_map_path")),
             "final_output_dir": _safe_path(run_dirs["output_dir"]),
-            "downloads_dir": _safe_path(run_dirs["downloads_dir"]),
+            "downloads_dir": _safe_path(run_dirs["raw_dir"]),
+            "action_log_dir": _safe_path(run_dirs["action_log_dir"]),
+            "enable_report_download": report_enabled,
+            "enable_action_log_download": action_log_enabled,
         },
     )
     if not ok:
@@ -854,19 +1013,33 @@ def _status_style_text(value: Any) -> str:
     return STATUS_STYLE.get(phase, "")
 
 
-def _style_status_column(df: pd.DataFrame, status_column: str = "상태"):
-    if status_column not in df.columns:
-        return df.style
-    styler = df.style
+def _missing_columns_style_text(value: Any) -> str:
+    return "color: #b91c1c; font-weight: 700;" if _safe_text(value) else ""
+
+
+def _map_styler(styler, func, subset: list[str]):
     if hasattr(styler, "map"):
-        return styler.map(_status_style_text, subset=[status_column])
+        return styler.map(func, subset=subset)
     if hasattr(styler, "applymap"):
-        return styler.applymap(_status_style_text, subset=[status_column])
+        return styler.applymap(func, subset=subset)
+    return styler
+
+
+def _style_status_column(df: pd.DataFrame, status_column: str = "상태"):
+    styler = df.style
+    if status_column in df.columns:
+        styler = _map_styler(styler, _status_style_text, subset=[status_column])
     return styler
 
 
 def _render_bottom_section(snapshot: dict[str, Any]) -> None:
-    st.markdown("#### 실행 로그")
+    run_report_enabled = bool(
+        st.session_state.get("run_enable_report_download", st.session_state.get("enable_report_download", True))
+    )
+    run_action_log_enabled = bool(
+        st.session_state.get("run_enable_action_log_download", st.session_state.get("enable_action_log_download", True))
+    )
+    st.markdown("#### 캠페인 데이터 다운로드")
     rows = snapshot.get("rows") or []
     if rows:
         row_df = pd.DataFrame(
@@ -878,6 +1051,7 @@ def _render_bottom_section(snapshot: dict[str, Any]) -> None:
                     "target": row.target_display,
                     "status": _status_label_text(row.status),
                     "message": row.message,
+                    "missing_columns": row.missing_columns_text,
                     "last_updated": row.last_updated,
                 }
                 for row in rows
@@ -891,20 +1065,27 @@ def _render_bottom_section(snapshot: dict[str, Any]) -> None:
                 "target": "리포트",
                 "status": "상태",
                 "message": "메시지",
+                "missing_columns": "누락 컬럼",
                 "last_updated": "최종 갱신",
             }
         )
         styled_row_df = _style_status_column(row_df, "상태")
+        styled_row_df = _map_styler(styled_row_df, _missing_columns_style_text, subset=["누락 컬럼"])
         st.dataframe(styled_row_df, width="stretch", hide_index=True)
     else:
         st.markdown(
-            "<div class='ga-disabled-box'>실행 로그가 없습니다.</div>",
+            "<div class='ga-disabled-box'>캠페인 데이터 다운로드 이력이 없습니다.</div>",
             unsafe_allow_html=True,
         )
 
-    st.markdown("#### 통합본 생성 상태")
+    st.markdown("#### 캠페인 데이터 통합본 생성")
     account_stage_rows = snapshot.get("account_stage_rows") or []
-    if account_stage_rows:
+    if not run_report_enabled:
+        st.markdown(
+            "<div class='ga-disabled-box'>캠페인 데이터 다운로드를 켜면 캠페인 데이터 통합본 생성 상태가 표시됩니다.</div>",
+            unsafe_allow_html=True,
+        )
+    elif account_stage_rows:
         def _account_key(name: str, cid: str, activity_key: str) -> str:
             return f"{_safe_text(name)}|{_safe_text(cid)}|{_safe_text(activity_key)}"
 
@@ -914,10 +1095,10 @@ def _render_bottom_section(snapshot: dict[str, Any]) -> None:
                 continue
             key = _account_key(row.account, row.cid, row.activity_key)
             if key not in progress_map:
-                progress_map[key] = {"completed": 0, "total": 0}
+                progress_map[key] = {"processed": 0, "total": 0}
             progress_map[key]["total"] += 1
-            if _ui_phase_key(row.status) == "completed":
-                progress_map[key]["completed"] += 1
+            if _ui_phase_key(row.status) in {"completed", "failed"}:
+                progress_map[key]["processed"] += 1
 
         account_stage_df = pd.DataFrame(
             [
@@ -927,7 +1108,7 @@ def _render_bottom_section(snapshot: dict[str, Any]) -> None:
                     "activity": row.activity,
                     "status": _status_label_text(row.status),
                     "processed_sheets": (
-                        f"{progress_map.get(_account_key(row.account, row.cid, row.activity_key), {}).get('completed', 0)}/"
+                        f"{progress_map.get(_account_key(row.account, row.cid, row.activity_key), {}).get('processed', 0)}/"
                         f"{progress_map.get(_account_key(row.account, row.cid, row.activity_key), {}).get('total', 0)}"
                     ),
                     "message": row.message,
@@ -952,7 +1133,47 @@ def _render_bottom_section(snapshot: dict[str, Any]) -> None:
         st.dataframe(styled_account_stage_df, width="stretch", hide_index=True)
     else:
         st.markdown(
-            "<div class='ga-disabled-box'>다운로드 후 통합본 생성 상태가 표시됩니다.</div>",
+            "<div class='ga-disabled-box'>다운로드 후 캠페인 데이터 통합본 생성 상태가 표시됩니다.</div>",
+            unsafe_allow_html=True,
+        )
+
+    st.markdown("#### 액션 로그 다운로드")
+    action_log_rows = snapshot.get("action_log_rows") or []
+    if not run_action_log_enabled:
+        st.markdown(
+            "<div class='ga-disabled-box'>액션 로그 다운로드를 켜면 액션 로그 다운로드 상태가 표시됩니다.</div>",
+            unsafe_allow_html=True,
+        )
+    elif action_log_rows:
+        action_log_df = pd.DataFrame(
+            [
+                {
+                    "account": row.account,
+                    "cid": row.cid,
+                    "activity": row.activity,
+                    "status": _status_label_text(row.status),
+                    "message": row.message,
+                    "updated_at": row.updated_at,
+                }
+                for row in action_log_rows
+                if isinstance(row, ActionLogRow)
+            ]
+        ).rename(
+            columns={
+                "account": "계정",
+                "cid": "CID",
+                "activity": "액티비티",
+                "status": "상태",
+                "message": "메시지",
+                "updated_at": "시간",
+            }
+        )
+        action_log_df = action_log_df.sort_values(by=["시간"], ascending=False)
+        styled_action_log_df = _style_status_column(action_log_df, "상태")
+        st.dataframe(styled_action_log_df, width="stretch", hide_index=True)
+    else:
+        st.markdown(
+            "<div class='ga-disabled-box'>매칭 후 액션 로그 다운로드 상태가 표시됩니다.</div>",
             unsafe_allow_html=True,
         )
 
@@ -961,6 +1182,11 @@ def _validate_output_count(snapshot: dict[str, Any]) -> None:
     run_id = _safe_text(snapshot.get("run_id"))
     run_status = _safe_text(snapshot.get("run_status"))
     if not run_id or run_status not in {"Completed", "Completed (With Failures)"}:
+        return
+
+    if not bool(st.session_state.get("run_enable_report_download", True)):
+        st.session_state["validated_output_count_run"] = run_id
+        st.session_state["expected_output_count"] = 0
         return
 
     if _safe_text(st.session_state.get("validated_output_count_run")) == run_id:
@@ -1001,20 +1227,17 @@ def _open_output_folder_for_completed_run(snapshot: dict[str, Any]) -> None:
     if _safe_text(st.session_state.get("opened_output_for_run")) == run_id:
         return
 
-    outputs = snapshot.get("outputs") or []
-    opened = False
-    for item in outputs:
-        if not isinstance(item, dict):
-            continue
-        workbook_path = _safe_text(item.get("workbook_path"))
-        if workbook_path:
-            opened = open_file_in_explorer(Path(workbook_path)) or opened
+    output_root_dir = _safe_text(st.session_state.get("run_output_root_dir"))
+    if not output_root_dir:
+        output_root_dir = str(_build_storage_roots()["output_root"])
 
-    if not opened:
-        run_output_dir = _safe_text(st.session_state.get("run_output_dir"))
-        if run_output_dir:
+    try:
+        subprocess.Popen(["explorer", output_root_dir])  # noqa: S603
+    except Exception:
+        fallback_dir = _safe_text(st.session_state.get("run_output_dir")) or output_root_dir
+        if fallback_dir:
             try:
-                subprocess.Popen(["explorer", run_output_dir])  # noqa: S603
+                subprocess.Popen(["explorer", fallback_dir])  # noqa: S603
             except Exception:
                 pass
 

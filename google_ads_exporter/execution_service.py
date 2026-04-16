@@ -37,8 +37,12 @@ class LogRow:
     activity_key: str
     target_key: str
     target_display: str
+    sheet_name: str
     status: str
     message: str
+    row_count_text: str
+    missing_columns_text: str
+    has_warning: bool
     last_updated: str
 
 
@@ -54,6 +58,17 @@ class AccountStageRow:
     updated_at: str
 
 
+@dataclass(frozen=True, slots=True)
+class ActionLogRow:
+    account: str
+    cid: str
+    activity: str
+    activity_key: str
+    status: str
+    message: str
+    updated_at: str
+
+
 class ExecutionStateStore:
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -61,10 +76,16 @@ class ExecutionStateStore:
         self._rows: dict[str, LogRow] = {}
         self._row_order: list[str] = []
         self._account_stage_map: dict[str, AccountStageRow] = {}
+        self._action_log_row_map: dict[str, ActionLogRow] = {}
+        self._action_log_row_order: list[str] = []
         self._messages: list[dict[str, str]] = []
         self._outputs: list[dict[str, str]] = []
+        self._action_log_outputs: list[dict[str, str]] = []
         self._summaries: list[dict[str, Any]] = []
         self._scan_result_rows: list[dict[str, Any]] = []
+        self._login_accounts_payload: list[dict[str, Any]] = []
+        self._login_browser_used = ""
+        self._login_worker_log_file = ""
         self._thread: threading.Thread | None = None
         self._running = False
         self.run_status = "Idle"
@@ -86,7 +107,10 @@ class ExecutionStateStore:
             self._rows = {}
             self._row_order = []
             self._account_stage_map = {}
+            self._action_log_row_map = {}
+            self._action_log_row_order = []
             self._outputs = []
+            self._action_log_outputs = []
             self._summaries = []
             self._scan_result_rows = []
             self.last_error = ""
@@ -113,6 +137,10 @@ class ExecutionStateStore:
         activity_key: str = "",
         target_key: str = "",
         target_display: str = "",
+        sheet_name: str | None = None,
+        row_count_text: str | None = None,
+        missing_columns_text: str | None = None,
+        has_warning: bool | None = None,
     ) -> None:
         existing = self._rows.get(row_id)
         if existing:
@@ -124,8 +152,16 @@ class ExecutionStateStore:
                 activity_key=activity_key or existing.activity_key,
                 target_key=target_key or existing.target_key,
                 target_display=target_display or existing.target_display,
+                sheet_name=existing.sheet_name if sheet_name is None else str(sheet_name or "").strip(),
                 status=status,
                 message=message,
+                row_count_text=existing.row_count_text if row_count_text is None else str(row_count_text or "").strip(),
+                missing_columns_text=(
+                    existing.missing_columns_text
+                    if missing_columns_text is None
+                    else str(missing_columns_text or "").strip()
+                ),
+                has_warning=existing.has_warning if has_warning is None else bool(has_warning),
                 last_updated=_now_text(),
             )
             return
@@ -143,12 +179,51 @@ class ExecutionStateStore:
             activity_key=str(activity_key or "-").strip(),
             target_key=effective_target_key or "-",
             target_display=effective_target_display,
+            sheet_name=str(sheet_name or "").strip(),
             status=status,
             message=message,
+            row_count_text=str(row_count_text or "").strip(),
+            missing_columns_text=str(missing_columns_text or "").strip(),
+            has_warning=bool(has_warning),
             last_updated=_now_text(),
         )
         self._rows[row_id] = row
         self._row_order.append(row_id)
+
+    def _update_action_log_row(
+        self,
+        *,
+        account: str,
+        cid: str,
+        activity: str,
+        activity_key: str,
+        status: str,
+        message: str,
+    ) -> None:
+        key = f"{str(account or '').strip()}|{str(cid or '').strip()}|{str(activity_key or '').strip()}"
+        existing = self._action_log_row_map.get(key)
+        if existing:
+            self._action_log_row_map[key] = ActionLogRow(
+                account=existing.account,
+                cid=existing.cid,
+                activity=activity or existing.activity,
+                activity_key=existing.activity_key,
+                status=status,
+                message=message,
+                updated_at=_now_text(),
+            )
+            return
+
+        self._action_log_row_map[key] = ActionLogRow(
+            account=str(account or "-").strip(),
+            cid=str(cid or "-").strip(),
+            activity=str(activity or "-").strip(),
+            activity_key=str(activity_key or "-").strip(),
+            status=status,
+            message=message,
+            updated_at=_now_text(),
+        )
+        self._action_log_row_order.append(key)
 
     def drain_events(self) -> None:
         while True:
@@ -163,6 +238,11 @@ class ExecutionStateStore:
                     self.run_id = str(event.get("run_id") or self.run_id)
                     self.log_file = str(event.get("log_file") or self.log_file)
                     self.run_status = str(event.get("run_status") or "Running")
+                    self._login_accounts_payload = []
+                    self._login_browser_used = ""
+                    self._login_worker_log_file = ""
+                    if self.run_status == "Preparing":
+                        self.login_status = "Waiting Login"
                 elif event_type == "login_status":
                     self.login_status = str(event.get("status") or self.login_status)
                     message = str(event.get("message") or "").strip()
@@ -185,8 +265,15 @@ class ExecutionStateStore:
                             "level": "success",
                             "text": text,
                             "time": _now_text(),
-                        }
-                    )
+                            }
+                        )
+                elif event_type == "login_accounts_ready":
+                    accounts = event.get("accounts")
+                    self._login_accounts_payload = [
+                        dict(item) for item in accounts if isinstance(item, dict)
+                    ] if isinstance(accounts, list) else []
+                    self._login_browser_used = str(event.get("browser_used") or "")
+                    self._login_worker_log_file = str(event.get("log_file") or "")
                 elif event_type == "row_update":
                     self._update_row(
                         row_id=str(event.get("row_id") or ""),
@@ -198,6 +285,12 @@ class ExecutionStateStore:
                         activity_key=str(event.get("activity_key") or ""),
                         target_key=str(event.get("target_key") or ""),
                         target_display=str(event.get("target_display") or ""),
+                        sheet_name=event["sheet_name"] if "sheet_name" in event else None,
+                        row_count_text=event["row_count_text"] if "row_count_text" in event else None,
+                        missing_columns_text=(
+                            event["missing_columns_text"] if "missing_columns_text" in event else None
+                        ),
+                        has_warning=event["has_warning"] if "has_warning" in event else None,
                     )
                 elif event_type == "account_result":
                     account = str(event.get("account") or "")
@@ -244,6 +337,27 @@ class ExecutionStateStore:
                         message=str(event.get("message") or ""),
                         updated_at=_now_text(),
                     )
+                elif event_type == "action_log_update":
+                    self._update_action_log_row(
+                        account=str(event.get("account") or ""),
+                        cid=str(event.get("cid") or ""),
+                        activity=str(event.get("activity") or "-"),
+                        activity_key=str(event.get("activity_key") or "-"),
+                        status=str(event.get("status") or "Waiting"),
+                        message=str(event.get("message") or ""),
+                    )
+                elif event_type == "action_log_result":
+                    file_path = str(event.get("file_path") or "").strip()
+                    if file_path:
+                        self._action_log_outputs.append(
+                            {
+                                "account": str(event.get("account") or ""),
+                                "cid": str(event.get("cid") or ""),
+                                "activity": str(event.get("activity") or ""),
+                                "activity_key": str(event.get("activity_key") or ""),
+                                "file_path": file_path,
+                            }
+                        )
                 elif event_type == "run_warning":
                     self._messages.append(
                         {
@@ -292,9 +406,18 @@ class ExecutionStateStore:
                 "rows": rows,
                 "messages": list(self._messages[-14:]),
                 "outputs": list(self._outputs),
+                "action_log_outputs": list(self._action_log_outputs),
                 "summaries": list(self._summaries),
                 "scan_result_rows": list(self._scan_result_rows),
+                "login_accounts_payload": list(self._login_accounts_payload),
+                "login_browser_used": self._login_browser_used,
+                "login_worker_log_file": self._login_worker_log_file,
                 "account_stage_rows": list(self._account_stage_map.values()),
+                "action_log_rows": [
+                    self._action_log_row_map[row_id]
+                    for row_id in self._action_log_row_order
+                    if row_id in self._action_log_row_map
+                ],
                 "is_running": self._running,
             }
 

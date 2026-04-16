@@ -40,3 +40,12 @@ class DownloadResult:
     activity_key: str = ""
     filename: str | None = None
     reason: str | None = None
+
+
+@dataclass(slots=True)
+class ActionLogResult:
+    activity_name: str
+    activity_key: str
+    success: bool
+    filename: str | None = None
+    reason: str | None = None
