@@ -24,6 +24,17 @@ from .auth import (
     maximize_browser_window,
     minimize_browser_window,
 )
+from .execution_service import (
+    ACTION_LOG_EXPORTING_MESSAGE,
+    HISTORY_WAITING_FOR_PRIOR_ACTIVITY_MESSAGE,
+    HISTORY_WAITING_FOR_REPORT_MESSAGE,
+    REPORT_DOWNLOAD_COMPLETED_PREFIX,
+    REPORT_DOWNLOAD_PENDING_SAVE_MESSAGE,
+    REPORT_DOWNLOAD_START_MESSAGE,
+    REPORT_NOT_FOUND_MESSAGE,
+    REPORT_WAITING_FOR_PRIOR_SHEET_MESSAGE,
+    WORKBOOK_WAITING_MESSAGE,
+)
 from .google_excel_builder import POLICY_BY_TARGET, create_unified_workbook_for_account, summaries_as_rows
 from .main import _download_targets_for_account, ensure_account_report_editor_ready, scan_account_saved_reports
 from .models import AdsAccount, DownloadResult, SavedReportItem
@@ -38,6 +49,7 @@ WORKER_HEARTBEAT_TIMEOUT_SEC = 120.0
 LOGIN_WORKER_TIMEOUT_SEC = 60.0 * 45.0
 EXPORT_WORKER_TIMEOUT_SEC = 60.0 * 90.0
 LOGIN_WORKER_RESULT_GRACE_SEC = 3.0
+EXPORT_WORKER_RESULT_GRACE_SEC = 3.0
 
 
 def _now_run_id() -> str:
@@ -430,6 +442,25 @@ def _worker_scan_and_export(
     logger, log_path = setup_logger("google_ads_exporter.worker.export")
     _ensure_playwright_event_loop_policy(logger=logger)
     stop_event, heartbeat_thread = _start_worker_heartbeat(event_queue)
+    result_published = False
+
+    def _publish_success(
+        scan_results: dict[str, dict[str, Any]],
+        scan_rows: list[dict[str, Any]],
+    ) -> None:
+        nonlocal result_published
+        if result_published:
+            return
+        result_queue.put(
+            {
+                "ok": True,
+                "scan_results": _serialize_scan_results(scan_results),
+                "scan_rows": scan_rows,
+                "log_file": str(log_path),
+            }
+        )
+        result_published = True
+
     try:
         selected_accounts = [_account_from_dict(item) for item in selected_accounts_payload]
         scan_results, scan_rows = run_google_export_for_accounts(
@@ -446,25 +477,26 @@ def _worker_scan_and_export(
             logger=logger,
             progress_cb=event_queue.put,
             scan_before_export=True,
+            on_run_completed=_publish_success,
         )
-        result_queue.put(
-            {
-                "ok": True,
-                "scan_results": _serialize_scan_results(scan_results),
-                "scan_rows": scan_rows,
-                "log_file": str(log_path),
-            }
-        )
+        _publish_success(scan_results, scan_rows)
     except Exception as exc:  # noqa: BLE001
         error_text = _exc_text(exc)
-        event_queue.put({"type": "run_failed", "error": f"Execution failed: {error_text}"})
-        result_queue.put(
-            {
-                "ok": False,
-                "error": error_text,
-                "log_file": str(log_path),
-            }
-        )
+        if result_published:
+            if logger:
+                logger.warning(
+                    "export worker cleanup failed after publishing result | reason=%s",
+                    error_text,
+                )
+        else:
+            event_queue.put({"type": "run_failed", "error": f"Execution failed: {error_text}"})
+            result_queue.put(
+                {
+                    "ok": False,
+                    "error": error_text,
+                    "log_file": str(log_path),
+                }
+            )
     finally:
         stop_event.set()
         heartbeat_thread.join(timeout=1.0)
@@ -644,6 +676,8 @@ def run_scan_and_export_in_subprocess(
         },
         progress_cb=progress_cb,
         timeout_sec=EXPORT_WORKER_TIMEOUT_SEC,
+        return_on_result=True,
+        post_result_grace_sec=EXPORT_WORKER_RESULT_GRACE_SEC,
     )
     if not bool(result.get("ok")):
         raise RuntimeError(str(result.get("error") or "export worker failed"))
@@ -882,6 +916,160 @@ def _matched_activity_entries(
     return entries
 
 
+def _matched_target_keys(matched_map: dict[str, SavedReportItem]) -> list[str]:
+    keys: list[str] = []
+    for target_key in TARGET_ORDER:
+        report_item = matched_map.get(target_key)
+        if isinstance(report_item, SavedReportItem):
+            keys.append(target_key)
+    return keys
+
+
+def _matched_target_count(matched_map: dict[str, SavedReportItem]) -> int:
+    return len(_matched_target_keys(matched_map))
+
+
+def _matched_map_by_activity_for_account(
+    *,
+    selected: AdsAccount,
+    account: AdsAccount,
+    scan_results: dict[str, dict[str, Any]],
+) -> dict[str, dict[str, SavedReportItem]]:
+    matched_map_by_activity = scan_results.get(selected.cid_digits, {}).get("matched_map_by_activity", {})
+    if not matched_map_by_activity:
+        matched_map_by_activity = scan_results.get(account.cid_digits, {}).get("matched_map_by_activity", {})
+    return matched_map_by_activity if isinstance(matched_map_by_activity, dict) else {}
+
+
+def _emit_report_row_seed(
+    progress_cb: ProgressCallback | None,
+    *,
+    account: AdsAccount,
+    matched_map_by_activity: dict[str, dict[str, SavedReportItem]],
+) -> None:
+    for activity_key, activity_name in _matched_activity_entries(matched_map_by_activity):
+        matched_map = matched_map_by_activity.get(activity_key, {})
+        if not isinstance(matched_map, dict):
+            continue
+        for target_key in TARGET_ORDER:
+            report_item = matched_map.get(target_key)
+            is_matched = isinstance(report_item, SavedReportItem)
+            _emit(
+                progress_cb,
+                {
+                    "type": "row_update",
+                    "row_id": _row_id(
+                        cid_digits=account.cid_digits,
+                        activity_key=activity_key,
+                        target_key=target_key,
+                    ),
+                    "account": account.name,
+                    "cid": account.cid,
+                    "activity": activity_name,
+                    "activity_key": activity_key,
+                    "target_key": target_key,
+                    "target_display": TARGET_DISPLAY_NAMES.get(target_key, target_key),
+                    "status": "Waiting" if is_matched else "Not Found",
+                    "message": (
+                        REPORT_WAITING_FOR_PRIOR_SHEET_MESSAGE
+                        if is_matched
+                        else REPORT_NOT_FOUND_MESSAGE
+                    ),
+                },
+            )
+
+
+def _emit_workbook_waiting_rows(
+    progress_cb: ProgressCallback | None,
+    *,
+    account: AdsAccount,
+    matched_map_by_activity: dict[str, dict[str, SavedReportItem]],
+) -> None:
+    for activity_key, activity_name in _matched_activity_entries(matched_map_by_activity):
+        matched_map = matched_map_by_activity.get(activity_key, {})
+        if not isinstance(matched_map, dict):
+            continue
+        total_sheet_count = _matched_target_count(matched_map)
+        if total_sheet_count <= 0:
+            continue
+        _emit(
+            progress_cb,
+            {
+                "type": "account_stage",
+                "account": account.name,
+                "cid": account.cid,
+                "activity": activity_name,
+                "activity_key": activity_key,
+                "stage": "통합본",
+                "status": "Waiting",
+                "message": WORKBOOK_WAITING_MESSAGE,
+                "processed_sheet_count": 0,
+                "total_sheet_count": total_sheet_count,
+            },
+        )
+
+
+def _emit_action_log_waiting_rows(
+    progress_cb: ProgressCallback | None,
+    *,
+    account: AdsAccount,
+    activity_entries: list[tuple[str, str]],
+    message: str,
+    first_status: str | None = None,
+    first_message: str | None = None,
+) -> None:
+    for index, (activity_key, activity_name) in enumerate(activity_entries):
+        effective_status = "Waiting"
+        effective_message = message
+        if index == 0 and first_status:
+            effective_status = first_status
+            effective_message = first_message or message
+        _emit_action_log_update(
+            progress_cb,
+            account=account,
+            activity_name=activity_name,
+            activity_key=activity_key,
+            status=effective_status,
+            message=effective_message,
+        )
+
+
+def _emit_action_log_prior_activity_waiting_rows(
+    progress_cb: ProgressCallback | None,
+    *,
+    account: AdsAccount,
+    activity_entries: list[tuple[str, str]],
+) -> None:
+    for activity_key, activity_name in activity_entries[1:]:
+        _emit_action_log_update(
+            progress_cb,
+            account=account,
+            activity_name=activity_name,
+            activity_key=activity_key,
+            status="Waiting",
+            message=HISTORY_WAITING_FOR_PRIOR_ACTIVITY_MESSAGE,
+        )
+
+
+def _normalized_report_row_status_and_message(*, status: str, detail: str | None) -> tuple[str, str]:
+    normalized = str(status or "").strip().replace("-", "_").replace(" ", "_").lower()
+    detail_text = str(detail or "").strip()
+    if normalized == "not_found":
+        return "Not Found", REPORT_NOT_FOUND_MESSAGE
+    if normalized == "downloading":
+        return "Exporting", REPORT_DOWNLOAD_START_MESSAGE
+    if normalized == "exporting":
+        return "Exporting", REPORT_DOWNLOAD_PENDING_SAVE_MESSAGE
+    if normalized in {"downloaded", "completed"}:
+        filename = detail_text or "-"
+        return "Completed", f"{REPORT_DOWNLOAD_COMPLETED_PREFIX}{filename}"
+    if normalized in {"failed", "error"}:
+        return "Failed", detail_text or "download failed"
+    if normalized == "waiting":
+        return "Waiting", detail_text or REPORT_WAITING_FOR_PRIOR_SHEET_MESSAGE
+    return str(status or "").strip().replace("_", " ").title() or "Waiting", detail_text
+
+
 def _emit_action_log_update(
     progress_cb: ProgressCallback | None,
     *,
@@ -905,29 +1093,12 @@ def _emit_action_log_update(
     )
 
 
-def _emit_action_log_waiting_rows(
-    progress_cb: ProgressCallback | None,
-    *,
-    account: AdsAccount,
-    activity_entries: list[tuple[str, str]],
-) -> None:
-    for activity_key, activity_name in activity_entries:
-        _emit_action_log_update(
-            progress_cb,
-            account=account,
-            activity_name=activity_name,
-            activity_key=activity_key,
-            status="Waiting",
-            message="\uc561\uc158\ub85c\uadf8 \ub300\uae30\uc911",
-        )
-
-
 def _matching_completed_message(*, enable_report_download: bool, enable_action_log_download: bool) -> str:
     if enable_report_download and enable_action_log_download:
-        return "Matching completed. Report/action log execution starting."
+        return "액티비티 매칭이 완료되어 캠페인 데이터/액션 로그 다운로드를 시작합니다."
     if enable_report_download:
-        return "Matching completed. Report export starting."
-    return "Matching completed. Action log collection starting."
+        return "액티비티 매칭이 완료되어 캠페인 데이터 다운로드를 시작합니다."
+    return "액티비티 매칭이 완료되어 액션 로그 다운로드를 시작합니다."
 
 
 def _build_run_completed_message(
@@ -939,16 +1110,16 @@ def _build_run_completed_message(
     skipped_activities: int,
 ) -> str:
     if enable_report_download and enable_action_log_download:
-        message = f"Execution completed. Workbook count={workbook_count}, action log count={action_log_count}"
+        message = f"실행이 완료되었습니다. 통합본 {workbook_count}개, 액션 로그 {action_log_count}개를 저장했습니다."
         if skipped_activities:
-            message = f"{message}, skipped={skipped_activities}"
+            message = f"{message} (통합본 스킵 {skipped_activities}개)"
         return message
     if enable_report_download:
-        message = f"Export completed. Workbook count={workbook_count}"
+        message = f"캠페인 데이터 다운로드가 완료되었습니다. 통합본 {workbook_count}개를 저장했습니다."
         if skipped_activities:
-            message = f"{message}, skipped={skipped_activities}"
+            message = f"{message} (통합본 스킵 {skipped_activities}개)"
         return message
-    return f"Action log completed. File count={action_log_count}"
+    return f"액션 로그 다운로드가 완료되었습니다. 파일 {action_log_count}개를 저장했습니다."
 
 
 def _run_report_phase_for_account(
@@ -967,6 +1138,7 @@ def _run_report_phase_for_account(
     had_failures = False
     total_targets = len(TARGET_ORDER)
     account_label = f"{account.name} | {account.cid}"
+    matched_activity_entries = _matched_activity_entries(matched_map_by_activity)
 
     try:
         ensure_account_report_editor_ready(page=page, account=account, logger=logger)
@@ -981,20 +1153,30 @@ def _run_report_phase_for_account(
                 account.cid,
                 error_text,
             )
-        _emit(
-            progress_cb,
-            {
-                "type": "account_stage",
-                "account": account.name,
-                "cid": account.cid,
-                "activity": "-",
-                "stage": "\ud1b5\ud569\ubcf8",
-                "status": "Failed",
-                "message": error_text,
-            },
-        )
-        for activity_key, activity_name in _matched_activity_entries(matched_map_by_activity):
+        for activity_key, activity_name in matched_activity_entries:
+            matched_map = matched_map_by_activity.get(activity_key, {})
+            if not isinstance(matched_map, dict):
+                continue
+            matched_target_keys = set(_matched_target_keys(matched_map))
+            total_sheet_count = len(matched_target_keys)
+            _emit(
+                progress_cb,
+                {
+                    "type": "account_stage",
+                    "account": account.name,
+                    "cid": account.cid,
+                    "activity": activity_name,
+                    "activity_key": activity_key,
+                    "stage": "통합본",
+                    "status": "Failed",
+                    "message": error_text,
+                    "processed_sheet_count": 0,
+                    "total_sheet_count": total_sheet_count,
+                },
+            )
             for target_key in TARGET_ORDER:
+                if target_key not in matched_target_keys:
+                    continue
                 _emit(
                     progress_cb,
                     {
@@ -1016,30 +1198,17 @@ def _run_report_phase_for_account(
                 )
         return outputs_count, skipped_activities, had_failures
 
-    for activity_key, activity_name in _matched_activity_entries(matched_map_by_activity):
+    for activity_key, activity_name in matched_activity_entries:
         matched_map = matched_map_by_activity.get(activity_key, {})
         if not isinstance(matched_map, dict):
             continue
 
         processed_sheet_keys: set[str] = set()
-        active_sheet_key = ""
         processed_sheet_count = 0
+        matched_target_keys = set(_matched_target_keys(matched_map))
+        matched_target_count = len(matched_target_keys)
 
         try:
-            _emit(
-                progress_cb,
-                {
-                    "type": "account_stage",
-                    "account": account.name,
-                    "cid": account.cid,
-                    "activity": activity_name,
-                    "activity_key": activity_key,
-                    "stage": "\ub2e4\uc6b4\ub85c\ub4dc",
-                    "status": "Exporting",
-                    "message": "\ub2e4\uc6b4\ub85c\ub4dc \uc9c4\ud589\uc911",
-                },
-            )
-
             def _download_progress(
                 progress_account: AdsAccount,
                 target_key: str,
@@ -1049,7 +1218,10 @@ def _run_report_phase_for_account(
                 _activity_name: str = activity_name,
                 _activity_key: str = activity_key,
             ) -> None:
-                normalized = str(status or "").strip().replace("_", " ").title()
+                normalized, message = _normalized_report_row_status_and_message(
+                    status=str(status or ""),
+                    detail=detail,
+                )
                 _emit(
                     progress_cb,
                     {
@@ -1066,7 +1238,7 @@ def _run_report_phase_for_account(
                         "target_key": target_key,
                         "target_display": TARGET_DISPLAY_NAMES.get(target_key, target_key),
                         "status": normalized,
-                        "message": str(detail or ""),
+                        "message": message,
                     },
                 )
 
@@ -1087,27 +1259,8 @@ def _run_report_phase_for_account(
                 for result in download_results
                 if (not result.success) and (result.target_key in matched_map)
             ]
-            successful_downloads = sum(
-                1 for result in result_by_target.values() if result.success and result.filename
-            )
             if failed_retry_targets:
                 _minimize_browser_page(page, logger=logger, window_policy=window_policy)
-                _emit(
-                    progress_cb,
-                    {
-                        "type": "account_stage",
-                        "account": account.name,
-                        "cid": account.cid,
-                        "activity": activity_name,
-                        "activity_key": activity_key,
-                        "stage": "\ub2e4\uc6b4\ub85c\ub4dc",
-                        "status": "Exporting",
-                        "message": (
-                            f"{successful_downloads}/{total_targets} \ub2e4\uc6b4\ub85c\ub4dc \uc644\ub8cc, "
-                            f"\uc2e4\ud328 {len(failed_retry_targets)}\uac1c \uc7ac\uc2dc\ub3c4 \uc911(1/1)"
-                        ),
-                    },
-                )
                 retry_results = _download_targets_for_account(
                     page=page,
                     account=account,
@@ -1139,20 +1292,6 @@ def _run_report_phase_for_account(
             )
             final_failed_results = [result for result in download_results if not result.success]
 
-            _emit(
-                progress_cb,
-                {
-                    "type": "account_stage",
-                    "account": account.name,
-                    "cid": account.cid,
-                    "activity": activity_name,
-                    "activity_key": activity_key,
-                    "stage": "\ub2e4\uc6b4\ub85c\ub4dc",
-                    "status": "Completed" if not final_failed_results else "Failed",
-                    "message": f"{final_successful_downloads}/{total_targets} \ub2e4\uc6b4\ub85c\ub4dc \uc644\ub8cc",
-                },
-            )
-
             if final_failed_results:
                 skipped_activities += 1
                 had_failures = True
@@ -1168,12 +1307,14 @@ def _run_report_phase_for_account(
                         "cid": account.cid,
                         "activity": activity_name,
                         "activity_key": activity_key,
-                        "stage": "\ud1b5\ud569\ubcf8",
+                        "stage": "통합본",
                         "status": "Failed",
                         "message": (
                             f"\ud1b5\ud569\ubcf8 \uc0dd\uc131 \uc2a4\ud0b5 "
                             f"({len(final_failed_results)}/{total_targets} \uc2e4\ud328: {failed_display_names})"
                         ),
+                        "processed_sheet_count": processed_sheet_count,
+                        "total_sheet_count": matched_target_count,
                     },
                 )
                 if logger:
@@ -1194,9 +1335,11 @@ def _run_report_phase_for_account(
                     "cid": account.cid,
                     "activity": activity_name,
                     "activity_key": activity_key,
-                    "stage": "\ud1b5\ud569\ubcf8",
+                    "stage": "통합본",
                     "status": "Exporting",
                     "message": "\ud1b5\ud569\ubcf8 \uc0dd\uc131\uc911",
+                    "processed_sheet_count": processed_sheet_count,
+                    "total_sheet_count": matched_target_count,
                 },
             )
             if logger:
@@ -1217,7 +1360,7 @@ def _run_report_phase_for_account(
                 _activity_name: str = activity_name,
                 _activity_key: str = activity_key,
             ) -> None:
-                nonlocal active_sheet_key, processed_sheet_count
+                nonlocal processed_sheet_count
                 policy = POLICY_BY_TARGET.get(target_key)
                 sheet_name = ""
                 if summary is not None:
@@ -1232,29 +1375,8 @@ def _run_report_phase_for_account(
                     activity_key=_activity_key,
                     target_key=target_key,
                 )
-                target_display = TARGET_DISPLAY_NAMES.get(target_key, target_key)
 
                 if stage == "start":
-                    active_sheet_key = target_key
-                    _emit(
-                        progress_cb,
-                        {
-                            "type": "row_update",
-                            "row_id": row_id,
-                            "account": _account.name,
-                            "cid": _account.cid,
-                            "activity": _activity_name,
-                            "activity_key": _activity_key,
-                            "target_key": target_key,
-                            "target_display": target_display,
-                            "sheet_name": sheet_name,
-                            "status": "Exporting",
-                            "message": "시트 처리중",
-                            "row_count_text": "",
-                            "missing_columns_text": "",
-                            "has_warning": False,
-                        },
-                    )
                     _emit(
                         progress_cb,
                         {
@@ -1263,12 +1385,14 @@ def _run_report_phase_for_account(
                             "cid": _account.cid,
                             "activity": _activity_name,
                             "activity_key": _activity_key,
-                            "stage": "\ud1b5\ud569\ubcf8",
+                            "stage": "통합본",
                             "status": "Exporting",
                             "message": (
                                 f"\ud1b5\ud569\ubcf8 \uc0dd\uc131\uc911 "
-                                f"(\ud604\uc7ac \uc2dc\ud2b8: {sheet_name}, {processed_sheet_count}/{total_targets})"
+                                f"(\ud604\uc7ac \uc2dc\ud2b8: {sheet_name}, {processed_sheet_count}/{matched_target_count})"
                             ),
+                            "processed_sheet_count": processed_sheet_count,
+                            "total_sheet_count": matched_target_count,
                         },
                     )
                     return
@@ -1276,7 +1400,6 @@ def _run_report_phase_for_account(
                 if summary is None:
                     return
 
-                active_sheet_key = ""
                 processed_sheet_keys.add(target_key)
                 processed_sheet_count += 1
                 missing_columns = tuple(getattr(summary, "missing_columns", ()) or ())
@@ -1287,9 +1410,7 @@ def _run_report_phase_for_account(
                 )
                 row_count_text = ""
                 message = str(getattr(summary, "reason", "") or "failed").strip() or "failed"
-                status = "Failed"
                 if getattr(summary, "status", "") == "excel_written":
-                    status = "Completed"
                     row_count_text = (
                         f"\ucc98\ub9ac \ud589\uc218 "
                         f"{int(getattr(summary, 'written_rows', 0) or 0)}/"
@@ -1307,9 +1428,7 @@ def _run_report_phase_for_account(
                         "activity": _activity_name,
                         "activity_key": _activity_key,
                         "target_key": target_key,
-                        "target_display": target_display,
                         "sheet_name": sheet_name,
-                        "status": status,
                         "message": message,
                         "row_count_text": row_count_text,
                         "missing_columns_text": missing_columns_text,
@@ -1321,18 +1440,20 @@ def _run_report_phase_for_account(
                     {
                         "type": "account_stage",
                         "account": _account.name,
-                        "cid": _account.cid,
-                        "activity": _activity_name,
-                        "activity_key": _activity_key,
-                        "stage": "\ud1b5\ud569\ubcf8",
-                        "status": "Exporting",
-                        "message": (
-                            f"\ud1b5\ud569\ubcf8 \uc0dd\uc131\uc911 "
-                            f"({processed_sheet_count}/{total_targets} \uc2dc\ud2b8 \ucc98\ub9ac \uc644\ub8cc, "
-                            f"\ub9c8\uc9c0\ub9c9 \uc2dc\ud2b8: {sheet_name})"
-                        ),
-                    },
-                )
+                            "cid": _account.cid,
+                            "activity": _activity_name,
+                            "activity_key": _activity_key,
+                            "stage": "통합본",
+                            "status": "Exporting",
+                            "message": (
+                                f"\ud1b5\ud569\ubcf8 \uc0dd\uc131\uc911 "
+                                f"({processed_sheet_count}/{matched_target_count} \uc2dc\ud2b8 \ucc98\ub9ac \uc644\ub8cc, "
+                                f"\ub9c8\uc9c0\ub9c9 \uc2dc\ud2b8: {sheet_name})"
+                            ),
+                            "processed_sheet_count": processed_sheet_count,
+                            "total_sheet_count": matched_target_count,
+                        },
+                    )
 
             output_path, summaries = create_unified_workbook_for_account(
                 account=account,
@@ -1351,9 +1472,11 @@ def _run_report_phase_for_account(
                     "cid": account.cid,
                     "activity": activity_name,
                     "activity_key": activity_key,
-                    "stage": "\ud1b5\ud569\ubcf8",
+                    "stage": "통합본",
                     "status": "Completed",
                     "message": f"\ud1b5\ud569\ubcf8 \uc0dd\uc131\uc644\ub8cc:{output_path.name}",
+                    "processed_sheet_count": matched_target_count,
+                    "total_sheet_count": matched_target_count,
                 },
             )
             if logger:
@@ -1401,12 +1524,16 @@ def _run_report_phase_for_account(
                     "cid": account.cid,
                     "activity": activity_name,
                     "activity_key": activity_key,
-                    "stage": "\ud1b5\ud569\ubcf8",
+                    "stage": "통합본",
                     "status": "Failed",
                     "message": error_text,
+                    "processed_sheet_count": processed_sheet_count,
+                    "total_sheet_count": matched_target_count,
                 },
             )
             for target_key in TARGET_ORDER:
+                if target_key not in matched_target_keys:
+                    continue
                 if target_key in processed_sheet_keys:
                     continue
                 _emit(
@@ -1454,6 +1581,11 @@ def _run_action_log_phase_for_account(
 
     had_failures = False
     normalized_dir = Path(action_log_dir).expanduser().resolve()
+    _emit_action_log_prior_activity_waiting_rows(
+        progress_cb,
+        account=account,
+        activity_entries=activity_entries,
+    )
 
     def _action_log_progress(
         progress_account: AdsAccount,
@@ -1529,6 +1661,7 @@ def run_google_export_for_accounts(
     logger,
     progress_cb: ProgressCallback | None = None,
     scan_before_export: bool = False,
+    on_run_completed: Callable[[dict[str, dict[str, Any]], list[dict[str, Any]]], None] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
     from playwright.sync_api import sync_playwright
 
@@ -1643,32 +1776,6 @@ def run_google_export_for_accounts(
                                 account=account,
                                 logger=logger,
                             )
-                            for activity_key in sorted(matched_map_by_activity.keys()):
-                                matched_map = matched_map_by_activity.get(activity_key, {})
-                                if not isinstance(matched_map, dict):
-                                    continue
-                                activity_name = _resolve_activity_name(activity_key=activity_key, matched_map=matched_map)
-                                for target_key in TARGET_ORDER:
-                                    row_item = matched_map.get(target_key)
-                                    _emit(
-                                        progress_cb,
-                                        {
-                                            "type": "row_update",
-                                            "row_id": _row_id(
-                                                cid_digits=account.cid_digits,
-                                                activity_key=activity_key,
-                                                target_key=target_key,
-                                            ),
-                                            "account": account.name,
-                                            "cid": account.cid,
-                                            "activity": activity_name,
-                                            "activity_key": activity_key,
-                                            "target_key": target_key,
-                                            "target_display": TARGET_DISPLAY_NAMES.get(target_key, target_key),
-                                            "status": "Matched" if row_item else "Not Found",
-                                            "message": row_item.visible_name if row_item else "report not found",
-                                        },
-                                    )
                             effective_scan_results[account.cid_digits] = {
                                 "account": account,
                                 "items": items,
@@ -1696,19 +1803,38 @@ def run_google_export_for_accounts(
                             }
 
                     scan_rows = _scan_results_as_rows(effective_scan_results)
-                    _emit(progress_cb, {"type": "scan_results", "rows": scan_rows})
-                    _emit(
-                        progress_cb,
-                        {
-                            "type": "run_warning",
-                            "message": _matching_completed_message(
-                                enable_report_download=enable_report_download,
-                                enable_action_log_download=enable_action_log_download,
-                            ),
-                        },
-                    )
                 else:
                     scan_rows = _scan_results_as_rows(effective_scan_results)
+
+                _emit(progress_cb, {"type": "scan_results", "rows": scan_rows})
+                for selected in selected_accounts:
+                    account = discovered_by_cid.get(selected.cid_digits, selected)
+                    matched_map_by_activity = _matched_map_by_activity_for_account(
+                        selected=selected,
+                        account=account,
+                        scan_results=effective_scan_results,
+                    )
+                    if enable_report_download:
+                        _emit_report_row_seed(
+                            progress_cb,
+                            account=account,
+                            matched_map_by_activity=matched_map_by_activity,
+                        )
+                        _emit_workbook_waiting_rows(
+                            progress_cb,
+                            account=account,
+                            matched_map_by_activity=matched_map_by_activity,
+                        )
+                _emit(
+                    progress_cb,
+                    {
+                        "type": "run_warning",
+                        "message": _matching_completed_message(
+                            enable_report_download=enable_report_download,
+                            enable_action_log_download=enable_action_log_download,
+                        ),
+                    },
+                )
 
                 outputs_count = 0
                 action_log_count = 0
@@ -1716,33 +1842,44 @@ def run_google_export_for_accounts(
                 had_failures = False
 
                 if enable_action_log_download:
+                    first_history_export_seeded = False
                     for selected in selected_accounts:
                         account = discovered_by_cid.get(selected.cid_digits, selected)
-                        matched_map_by_activity: dict[str, dict[str, SavedReportItem]] = (
-                            effective_scan_results.get(selected.cid_digits, {}).get("matched_map_by_activity", {})
+                        matched_map_by_activity = _matched_map_by_activity_for_account(
+                            selected=selected,
+                            account=account,
+                            scan_results=effective_scan_results,
                         )
-                        if not matched_map_by_activity:
-                            matched_map_by_activity = effective_scan_results.get(account.cid_digits, {}).get(
-                                "matched_map_by_activity",
-                                {},
+                        activity_entries = _matched_activity_entries(matched_map_by_activity)
+                        if not activity_entries:
+                            continue
+                        if enable_report_download:
+                            _emit_action_log_waiting_rows(
+                                progress_cb,
+                                account=account,
+                                activity_entries=activity_entries,
+                                message=HISTORY_WAITING_FOR_REPORT_MESSAGE,
                             )
+                            continue
                         _emit_action_log_waiting_rows(
                             progress_cb,
                             account=account,
-                            activity_entries=_matched_activity_entries(matched_map_by_activity),
+                            activity_entries=activity_entries,
+                            message=HISTORY_WAITING_FOR_PRIOR_ACTIVITY_MESSAGE,
+                            first_status=None if first_history_export_seeded else "Exporting",
+                            first_message=None if first_history_export_seeded else ACTION_LOG_EXPORTING_MESSAGE,
                         )
+                        if not first_history_export_seeded:
+                            first_history_export_seeded = True
 
                 for selected in selected_accounts:
                     account = discovered_by_cid.get(selected.cid_digits, selected)
                     _minimize_browser_page(page, logger=logger, window_policy=window_policy)
-                    matched_map_by_activity: dict[str, dict[str, SavedReportItem]] = (
-                        effective_scan_results.get(selected.cid_digits, {}).get("matched_map_by_activity", {})
+                    matched_map_by_activity = _matched_map_by_activity_for_account(
+                        selected=selected,
+                        account=account,
+                        scan_results=effective_scan_results,
                     )
-                    if not matched_map_by_activity:
-                        matched_map_by_activity = effective_scan_results.get(account.cid_digits, {}).get(
-                            "matched_map_by_activity",
-                            {},
-                        )
 
                     if not matched_map_by_activity:
                         _emit(
@@ -1754,7 +1891,7 @@ def run_google_export_for_accounts(
                                 "activity": "-",
                                 "stage": "매칭",
                                 "status": "Failed",
-                                "message": "activity match not found",
+                                "message": "매칭된 액티비티를 찾지 못했습니다.",
                             },
                         )
                         had_failures = True
@@ -1802,6 +1939,8 @@ def run_google_export_for_accounts(
                         ),
                     },
                 )
+                if on_run_completed is not None:
+                    on_run_completed(effective_scan_results, scan_rows)
                 if logger:
                     logger.info(
                         "export completed | workbook_count=%s | action_log_count=%s | skipped_activities=%s | had_failures=%s",

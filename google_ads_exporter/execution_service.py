@@ -15,6 +15,18 @@ from .targets import TARGET_DISPLAY_NAMES
 ProgressCallback = Callable[[dict[str, Any]], None]
 ExportRunner = Callable[..., None]
 
+REPORT_WAITING_FOR_LOGIN_MESSAGE = "로그인 대기중입니다."
+REPORT_WAITING_FOR_PRIOR_SHEET_MESSAGE = "앞선 시트처리 대기중입니다."
+WORKBOOK_WAITING_MESSAGE = "캠페인 데이터 다운로드 후 통합본을 생성합니다."
+HISTORY_WAITING_FOR_REPORT_MESSAGE = "캠페인 데이터 다운로드 진행중입니다."
+HISTORY_WAITING_FOR_PRIOR_ACTIVITY_MESSAGE = "앞선 액티비티 처리 대기중입니다."
+REPORT_NOT_FOUND_MESSAGE = "리포트·뷰를 찾지 못했습니다."
+REPORT_DOWNLOAD_START_MESSAGE = "다운로드중입니다."
+REPORT_DOWNLOAD_PENDING_SAVE_MESSAGE = "다운로드 파일 저장 대기중입니다."
+REPORT_DOWNLOAD_COMPLETED_PREFIX = "다운로드 완료:"
+ACTION_LOG_EXPORTING_MESSAGE = "액션로그 다운로드중"
+ACTION_LOG_SAVED_PREFIX = "액션로그 저장완료:"
+
 
 def _now_text() -> str:
     return dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -55,6 +67,8 @@ class AccountStageRow:
     stage: str
     status: str
     message: str
+    processed_sheet_count: int
+    total_sheet_count: int
     updated_at: str
 
 
@@ -129,8 +143,8 @@ class ExecutionStateStore:
         self,
         *,
         row_id: str,
-        status: str,
-        message: str,
+        status: str | None = None,
+        message: str | None = None,
         account: str = "",
         cid: str = "",
         activity: str = "",
@@ -144,6 +158,8 @@ class ExecutionStateStore:
     ) -> None:
         existing = self._rows.get(row_id)
         if existing:
+            next_status = str(status or "").strip() or existing.status
+            next_message = existing.message if message is None else str(message or "").strip()
             self._rows[row_id] = LogRow(
                 row_id=existing.row_id,
                 account=account or existing.account,
@@ -153,8 +169,8 @@ class ExecutionStateStore:
                 target_key=target_key or existing.target_key,
                 target_display=target_display or existing.target_display,
                 sheet_name=existing.sheet_name if sheet_name is None else str(sheet_name or "").strip(),
-                status=status,
-                message=message,
+                status=next_status,
+                message=next_message,
                 row_count_text=existing.row_count_text if row_count_text is None else str(row_count_text or "").strip(),
                 missing_columns_text=(
                     existing.missing_columns_text
@@ -180,8 +196,8 @@ class ExecutionStateStore:
             target_key=effective_target_key or "-",
             target_display=effective_target_display,
             sheet_name=str(sheet_name or "").strip(),
-            status=status,
-            message=message,
+            status=str(status or "").strip() or "Waiting",
+            message="" if message is None else str(message or "").strip(),
             row_count_text=str(row_count_text or "").strip(),
             missing_columns_text=str(missing_columns_text or "").strip(),
             has_warning=bool(has_warning),
@@ -277,8 +293,8 @@ class ExecutionStateStore:
                 elif event_type == "row_update":
                     self._update_row(
                         row_id=str(event.get("row_id") or ""),
-                        status=str(event.get("status") or "Running"),
-                        message=str(event.get("message") or ""),
+                        status=event["status"] if "status" in event else None,
+                        message=event["message"] if "message" in event else None,
                         account=str(event.get("account") or ""),
                         cid=str(event.get("cid") or ""),
                         activity=str(event.get("activity") or ""),
@@ -335,6 +351,8 @@ class ExecutionStateStore:
                         stage=str(event.get("stage") or ""),
                         status=str(event.get("status") or "Waiting"),
                         message=str(event.get("message") or ""),
+                        processed_sheet_count=int(event.get("processed_sheet_count") or 0),
+                        total_sheet_count=int(event.get("total_sheet_count") or 0),
                         updated_at=_now_text(),
                     )
                 elif event_type == "action_log_update":

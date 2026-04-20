@@ -144,7 +144,7 @@ class ActionLogFlowTests(unittest.TestCase):
         action_mock.assert_not_called()
         self.assertFalse(any(event.get("type") == "action_log_update" for event in events))
 
-    def test_action_log_only_mode_uses_partial_match_activity_and_initializes_waiting_rows(self) -> None:
+    def test_action_log_only_mode_uses_partial_match_activity_and_starts_first_row(self) -> None:
         events, report_mock, action_mock, scan_rows = self._run_flow(
             enable_report_download=False,
             enable_action_log_download=True,
@@ -157,12 +157,13 @@ class ActionLogFlowTests(unittest.TestCase):
             action_mock.call_args.kwargs["activity_entries"],
             [("fcas", "FCAS")],
         )
-        waiting_events = [
+        exporting_events = [
             event for event in events
-            if event.get("type") == "action_log_update" and event.get("status") == "Waiting"
+            if event.get("type") == "action_log_update" and event.get("status") == "Exporting"
         ]
-        self.assertEqual(len(waiting_events), 1)
-        self.assertEqual(waiting_events[0]["activity_key"], "fcas")
+        self.assertEqual(len(exporting_events), 1)
+        self.assertEqual(exporting_events[0]["activity_key"], "fcas")
+        self.assertEqual(exporting_events[0]["message"], "액션로그 다운로드중")
         self.assertEqual(len(scan_rows), 7)
 
     def test_dual_mode_runs_report_before_action_log_for_each_account(self) -> None:
@@ -186,6 +187,46 @@ class ActionLogFlowTests(unittest.TestCase):
         self.assertEqual(report_mock.call_count, 1)
         self.assertEqual(action_mock.call_count, 1)
         self.assertEqual(call_order, ["report", "action"])
+
+    def test_dual_mode_seeds_report_rows_and_workbook_waiting_rows(self) -> None:
+        events, _report_mock, _action_mock, _scan_rows = self._run_flow(
+            enable_report_download=True,
+            enable_action_log_download=True,
+            report_helper_side_effect=(1, 0, False),
+            action_helper_side_effect=(1, False),
+        )
+
+        row_events = [event for event in events if event.get("type") == "row_update"]
+        self.assertEqual(len(row_events), 7)
+
+        waiting_rows = [event for event in row_events if event.get("status") == "Waiting"]
+        not_found_rows = [event for event in row_events if event.get("status") == "Not Found"]
+        self.assertEqual(len(waiting_rows), 1)
+        self.assertEqual(waiting_rows[0]["target_key"], "demographics")
+        self.assertEqual(waiting_rows[0]["message"], "앞선 시트처리 대기중입니다.")
+        self.assertEqual(len(not_found_rows), 6)
+        self.assertTrue(
+            all(event.get("message") == "리포트·뷰를 찾지 못했습니다." for event in not_found_rows)
+        )
+
+        workbook_events = [
+            event
+            for event in events
+            if event.get("type") == "account_stage" and event.get("stage") == "통합본"
+        ]
+        self.assertEqual(len(workbook_events), 1)
+        self.assertEqual(workbook_events[0]["status"], "Waiting")
+        self.assertEqual(workbook_events[0]["message"], "캠페인 데이터 다운로드 후 통합본을 생성합니다.")
+        self.assertEqual(workbook_events[0]["processed_sheet_count"], 0)
+        self.assertEqual(workbook_events[0]["total_sheet_count"], 1)
+
+        history_waiting_events = [
+            event
+            for event in events
+            if event.get("type") == "action_log_update" and event.get("status") == "Waiting"
+        ]
+        self.assertEqual(len(history_waiting_events), 1)
+        self.assertEqual(history_waiting_events[0]["message"], "캠페인 데이터 다운로드 진행중입니다.")
 
 
 if __name__ == "__main__":

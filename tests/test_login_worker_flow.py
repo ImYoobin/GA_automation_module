@@ -3,7 +3,12 @@ from __future__ import annotations
 import unittest
 from unittest.mock import Mock, patch
 
-from google_ads_exporter.google_adapter import _run_worker_process, _worker_login_and_crawl
+from google_ads_exporter.google_adapter import (
+    _run_worker_process,
+    _worker_login_and_crawl,
+    _worker_scan_and_export,
+    run_scan_and_export_in_subprocess,
+)
 from google_ads_exporter.models import AdsAccount
 
 
@@ -127,6 +132,81 @@ class LoginWorkerFlowTests(unittest.TestCase):
         logger.warning.assert_called_once()
         stop_event.set.assert_called_once()
         heartbeat_thread.join.assert_called_once_with(timeout=1.0)
+
+    def test_worker_scan_and_export_keeps_success_payload_when_cleanup_fails(self) -> None:
+        stop_event = Mock()
+        heartbeat_thread = Mock()
+        logger = Mock()
+        result_queue = Mock()
+
+        def _export_side_effect(**kwargs):
+            kwargs["on_run_completed"](
+                {
+                    "1234567890": {
+                        "account": {
+                            "name": "Innisfree Main",
+                            "cid": "123-456-7890",
+                            "cid_digits": "1234567890",
+                            "is_manager": False,
+                            "raw_text": "",
+                        },
+                        "items": [],
+                        "matched_map_by_activity": {},
+                    }
+                },
+                [{"account": "Innisfree Main", "cid": "123-456-7890", "activity_key": "fcas"}],
+            )
+            raise RuntimeError("cleanup failed")
+
+        with (
+            patch("google_ads_exporter.google_adapter.setup_logger", return_value=(logger, "C:/Temp/export.log")),
+            patch("google_ads_exporter.google_adapter._ensure_playwright_event_loop_policy"),
+            patch(
+                "google_ads_exporter.google_adapter._start_worker_heartbeat",
+                return_value=(stop_event, heartbeat_thread),
+            ),
+            patch("google_ads_exporter.google_adapter.run_google_export_for_accounts", side_effect=_export_side_effect),
+        ):
+            _worker_scan_and_export(
+                event_queue=Mock(),
+                result_queue=result_queue,
+                selected_accounts_payload=[],
+                browser="msedge",
+                headless=False,
+                target_map_path="",
+                final_output_dir="C:/Temp/output",
+                downloads_dir="C:/Temp/raw",
+                action_log_dir="C:/Temp/output/action_log",
+                enable_report_download=True,
+                enable_action_log_download=False,
+            )
+
+        self.assertEqual(result_queue.put.call_count, 1)
+        payload = result_queue.put.call_args.args[0]
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["scan_rows"][0]["activity_key"], "fcas")
+        logger.warning.assert_called_once()
+        stop_event.set.assert_called_once()
+        heartbeat_thread.join.assert_called_once_with(timeout=1.0)
+
+    def test_run_scan_and_export_in_subprocess_requests_early_return(self) -> None:
+        with patch("google_ads_exporter.google_adapter._run_worker_process", return_value={"ok": True, "scan_rows": []}) as worker_mock:
+            result = run_scan_and_export_in_subprocess(
+                selected_accounts=[],
+                browser="msedge",
+                headless=False,
+                target_map_path="",
+                final_output_dir="C:/Temp/output",
+                downloads_dir="C:/Temp/raw",
+                action_log_dir="C:/Temp/output/action_log",
+                enable_report_download=True,
+                enable_action_log_download=True,
+                progress_cb=None,
+            )
+
+        self.assertEqual(result["scan_rows"], [])
+        self.assertTrue(worker_mock.call_args.kwargs["return_on_result"])
+        self.assertGreater(worker_mock.call_args.kwargs["post_result_grace_sec"], 0.0)
 
 
 if __name__ == "__main__":

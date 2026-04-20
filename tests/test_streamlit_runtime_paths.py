@@ -82,6 +82,8 @@ class StreamlitRuntimePathTests(unittest.TestCase):
         snapshot = {
             "run_status": "Completed",
             "run_id": "run-1",
+            "outputs": [{"workbook_path": r"C:\Users\tester\GoogleAdsExport\output\20260416\test.xlsx"}],
+            "action_log_outputs": [],
         }
 
         with (
@@ -94,9 +96,63 @@ class StreamlitRuntimePathTests(unittest.TestCase):
         popen_mock.assert_called_once_with(["explorer", r"C:\Users\tester\GoogleAdsExport\output"])
         self.assertEqual(fake_st.session_state["opened_output_for_run"], "run-1")
 
+    def test_open_output_folder_for_completed_run_opens_for_action_log_only(self) -> None:
+        fake_st = SimpleNamespace(
+            session_state={
+                "opened_output_for_run": "",
+                "run_output_root_dir": r"C:\Users\tester\GoogleAdsExport\output",
+                "run_output_dir": r"C:\Users\tester\GoogleAdsExport\output\20260416",
+                "base_parent_dir": r"C:\Users\tester",
+            }
+        )
+        snapshot = {
+            "run_status": "Completed (With Failures)",
+            "run_id": "run-2",
+            "outputs": [],
+            "action_log_outputs": [{"file_path": r"C:\Users\tester\GoogleAdsExport\output\action_log\20260416\a.csv"}],
+        }
+
+        with (
+            patch.object(streamlit_app, "st", fake_st),
+            patch("google_ads_exporter.streamlit_app.subprocess.Popen") as popen_mock,
+        ):
+            streamlit_app._open_output_folder_for_completed_run(snapshot)
+
+        popen_mock.assert_called_once_with(["explorer", r"C:\Users\tester\GoogleAdsExport\output"])
+        self.assertEqual(fake_st.session_state["opened_output_for_run"], "run-2")
+
+    def test_open_output_folder_for_completed_run_skips_when_no_real_outputs(self) -> None:
+        fake_st = SimpleNamespace(
+            session_state={
+                "opened_output_for_run": "",
+                "run_output_root_dir": r"C:\Users\tester\GoogleAdsExport\output",
+                "run_output_dir": r"C:\Users\tester\GoogleAdsExport\output\20260416",
+                "base_parent_dir": r"C:\Users\tester",
+            }
+        )
+        snapshot = {
+            "run_status": "Completed",
+            "run_id": "run-3",
+            "outputs": [],
+            "action_log_outputs": [],
+        }
+
+        with (
+            patch.object(streamlit_app, "st", fake_st),
+            patch("google_ads_exporter.streamlit_app.subprocess.Popen") as popen_mock,
+        ):
+            streamlit_app._open_output_folder_for_completed_run(snapshot)
+
+        popen_mock.assert_not_called()
+        self.assertEqual(fake_st.session_state["opened_output_for_run"], "")
+
     def test_missing_columns_style_text_marks_non_empty_values_red(self) -> None:
         self.assertIn("#b91c1c", streamlit_app._missing_columns_style_text("Day, Campaign ID"))
         self.assertEqual(streamlit_app._missing_columns_style_text(""), "")
+
+    def test_status_helpers_map_not_found_and_downloaded(self) -> None:
+        self.assertEqual(streamlit_app._ui_phase_key("Not Found"), "not_found")
+        self.assertEqual(streamlit_app._status_label_text("Downloaded"), "Completed")
 
     def test_login_progress_helper_text_maps_waiting_and_crawling(self) -> None:
         waiting_text = streamlit_app._login_progress_helper_text(

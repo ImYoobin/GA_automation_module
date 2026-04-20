@@ -35,17 +35,17 @@ from google_ads_exporter.utils import setup_logger
 STATUS_LABEL = {
     "waiting": "Waiting",
     "exporting": "Exporting",
-    "downloaded": "Downloaded",
     "completed": "Completed",
     "failed": "Failed",
+    "not_found": "Not Found",
 }
 
 STATUS_STYLE = {
     "waiting": "background-color: #f1f5f9; color: #64748b; font-weight: 600;",
     "exporting": "background-color: #dbeafe; color: #1d4ed8; font-weight: 700;",
-    "downloaded": "background-color: #dcfce7; color: #166534; font-weight: 700;",
     "completed": "background-color: #dff3e6; color: #166534; font-weight: 700;",
     "failed": "background-color: #fee2e2; color: #b91c1c; font-weight: 700;",
+    "not_found": "background-color: #fff7ed; color: #c2410c; font-weight: 700;",
 }
 
 RUNTIME_SETTINGS_RELATIVE_PATH = Path("config") / "runtime_settings.json"
@@ -990,10 +990,12 @@ def _normalized_status_key(value: Any) -> str:
 
 def _ui_phase_key(value: Any) -> str:
     key = _normalized_status_key(value)
+    if key in {"not found", "not_found"}:
+        return "not_found"
     if key in {"failed", "error"}:
         return "failed"
     if key in {"downloaded"}:
-        return "downloaded"
+        return "completed"
     if key in {"completed", "excel_written"}:
         return "completed"
     if key in {"downloading", "exporting"}:
@@ -1041,7 +1043,12 @@ def _render_bottom_section(snapshot: dict[str, Any]) -> None:
     )
     st.markdown("#### 캠페인 데이터 다운로드")
     rows = snapshot.get("rows") or []
-    if rows:
+    if not run_report_enabled:
+        st.markdown(
+            "<div class='ga-disabled-box'>캠페인 데이터 다운로드를 켜면 캠페인 데이터 다운로드 상태가 표시됩니다.</div>",
+            unsafe_allow_html=True,
+        )
+    elif rows:
         row_df = pd.DataFrame(
             [
                 {
@@ -1074,7 +1081,7 @@ def _render_bottom_section(snapshot: dict[str, Any]) -> None:
         st.dataframe(styled_row_df, width="stretch", hide_index=True)
     else:
         st.markdown(
-            "<div class='ga-disabled-box'>캠페인 데이터 다운로드 이력이 없습니다.</div>",
+            "<div class='ga-disabled-box'>액티비티 매칭 후 캠페인 데이터 다운로드 상태가 표시됩니다.</div>",
             unsafe_allow_html=True,
         )
 
@@ -1086,20 +1093,6 @@ def _render_bottom_section(snapshot: dict[str, Any]) -> None:
             unsafe_allow_html=True,
         )
     elif account_stage_rows:
-        def _account_key(name: str, cid: str, activity_key: str) -> str:
-            return f"{_safe_text(name)}|{_safe_text(cid)}|{_safe_text(activity_key)}"
-
-        progress_map: dict[str, dict[str, int]] = {}
-        for row in rows:
-            if not isinstance(row, LogRow):
-                continue
-            key = _account_key(row.account, row.cid, row.activity_key)
-            if key not in progress_map:
-                progress_map[key] = {"processed": 0, "total": 0}
-            progress_map[key]["total"] += 1
-            if _ui_phase_key(row.status) in {"completed", "failed"}:
-                progress_map[key]["processed"] += 1
-
         account_stage_df = pd.DataFrame(
             [
                 {
@@ -1107,10 +1100,8 @@ def _render_bottom_section(snapshot: dict[str, Any]) -> None:
                     "cid": row.cid,
                     "activity": row.activity,
                     "status": _status_label_text(row.status),
-                    "processed_sheets": (
-                        f"{progress_map.get(_account_key(row.account, row.cid, row.activity_key), {}).get('processed', 0)}/"
-                        f"{progress_map.get(_account_key(row.account, row.cid, row.activity_key), {}).get('total', 0)}"
-                    ),
+                    "processed_sheets": f"{int(getattr(row, 'processed_sheet_count', 0) or 0)}/"
+                    f"{int(getattr(row, 'total_sheet_count', 0) or 0)}",
                     "message": row.message,
                     "updated_at": row.updated_at,
                 }
@@ -1133,7 +1124,7 @@ def _render_bottom_section(snapshot: dict[str, Any]) -> None:
         st.dataframe(styled_account_stage_df, width="stretch", hide_index=True)
     else:
         st.markdown(
-            "<div class='ga-disabled-box'>다운로드 후 캠페인 데이터 통합본 생성 상태가 표시됩니다.</div>",
+            "<div class='ga-disabled-box'>캠페인 데이터 다운로드 후 통합본 생성 상태가 표시됩니다.</div>",
             unsafe_allow_html=True,
         )
 
@@ -1173,7 +1164,7 @@ def _render_bottom_section(snapshot: dict[str, Any]) -> None:
         st.dataframe(styled_action_log_df, width="stretch", hide_index=True)
     else:
         st.markdown(
-            "<div class='ga-disabled-box'>매칭 후 액션 로그 다운로드 상태가 표시됩니다.</div>",
+            "<div class='ga-disabled-box'>액티비티 매칭 후 액션 로그 다운로드 상태가 표시됩니다.</div>",
             unsafe_allow_html=True,
         )
 
@@ -1222,6 +1213,11 @@ def _open_output_folder_for_completed_run(snapshot: dict[str, Any]) -> None:
     run_status = _safe_text(snapshot.get("run_status"))
     run_id = _safe_text(snapshot.get("run_id"))
     if run_status not in {"Completed", "Completed (With Failures)"} or not run_id:
+        return
+
+    workbook_outputs = snapshot.get("outputs") or []
+    action_log_outputs = snapshot.get("action_log_outputs") or []
+    if (not workbook_outputs) and (not action_log_outputs):
         return
 
     if _safe_text(st.session_state.get("opened_output_for_run")) == run_id:
