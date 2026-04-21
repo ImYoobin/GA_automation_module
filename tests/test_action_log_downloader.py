@@ -9,6 +9,9 @@ from unittest.mock import MagicMock, Mock, patch
 from google_ads_exporter.action_log_downloader import (
     ALL_CHANGES_CHIP_SELECTOR,
     CSV_REGEX,
+    DOWNLOAD_MENU_ITEM_SELECTOR,
+    DOWNLOAD_MENU_SELECTOR,
+    EXACT_CSV_MENU_ITEM_SELECTOR,
     FILTER_CHIP_SELECTOR,
     FILTER_DELETE_BUTTON_SELECTOR,
     _add_campaign_name_filter,
@@ -140,23 +143,39 @@ class ActionLogDownloaderTests(unittest.TestCase):
 
         with (
             patch("google_ads_exporter.action_log_downloader._find_download_button", return_value=download_button),
-            patch("google_ads_exporter.action_log_downloader._first_visible_locator", return_value=csv_item) as first_visible_mock,
-            patch("google_ads_exporter.action_log_downloader._find_locator_by_text") as lookup_mock,
+            patch("google_ads_exporter.action_log_downloader._find_csv_menu_item", return_value=csv_item) as csv_lookup_mock,
             patch("google_ads_exporter.action_log_downloader._transform_action_log_csv") as transform_mock,
         ):
             saved_path = _download_action_log_csv(page, output_path=output_path)
 
         self.assertEqual(saved_path, output_path)
         download_button.click.assert_called_once_with(timeout=15_000)
-        first_visible_mock.assert_called_once()
-        lookup_mock.assert_not_called()
+        csv_lookup_mock.assert_called_once_with(page, logger=None)
         csv_item.click.assert_called_once_with(timeout=15_000)
         raw_download_path = build_action_log_raw_download_path(output_path)
         download.save_as.assert_called_once_with(str(raw_download_path))
         transform_mock.assert_called_once_with(raw_download_path=raw_download_path, output_path=output_path)
 
+    def test_find_csv_menu_item_prefers_exact_csv_item_inside_download_menu(self) -> None:
+        page = Mock()
+        menu_root = Mock()
+        exact_menu_item_locator = Mock()
+        exact_menu_item = Mock()
+
+        with (
+            patch("google_ads_exporter.action_log_downloader._wait_for_visible_locator", return_value=menu_root),
+            patch("google_ads_exporter.action_log_downloader._first_visible_locator", side_effect=[exact_menu_item, None, None]),
+        ):
+            menu_root.locator.return_value = exact_menu_item_locator
+            selected = _find_csv_menu_item(page)
+
+        self.assertIs(selected, exact_menu_item)
+        page.locator.assert_any_call(DOWNLOAD_MENU_SELECTOR)
+        menu_root.locator.assert_called_once_with("material-select-item[aria-label='.csv']")
+
     def test_find_csv_menu_item_falls_back_to_second_visible_item_after_excel_csv(self) -> None:
         page = Mock()
+        menu_root = Mock()
         exact_locator = Mock()
         role_locator = Mock()
         menu_locator = Mock()
@@ -164,12 +183,15 @@ class ActionLogDownloaderTests(unittest.TestCase):
         second_item = Mock()
 
         page.locator.side_effect = lambda selector: {
-            "material-select-item[role='menuitem'][aria-label='.csv']": exact_locator,
-            "[role='menu'] material-select-item[role='menuitem']": menu_locator,
+            DOWNLOAD_MENU_SELECTOR: menu_root,
+            EXACT_CSV_MENU_ITEM_SELECTOR: exact_locator,
+            DOWNLOAD_MENU_ITEM_SELECTOR: menu_locator,
             "material-select-item[role='menuitem']": menu_locator,
         }[selector]
         page.get_by_role.return_value = role_locator
 
+        menu_root.locator.return_value = Mock()
+        menu_root.locator.return_value.count.return_value = 0
         exact_locator.count.return_value = 0
         role_locator.count.return_value = 0
         menu_locator.count.return_value = 2
@@ -183,7 +205,8 @@ class ActionLogDownloaderTests(unittest.TestCase):
         second_item.inner_text.side_effect = RuntimeError("text unavailable")
         second_item.get_attribute.side_effect = lambda name: ""
 
-        selected = _find_csv_menu_item(page)
+        with patch("google_ads_exporter.action_log_downloader._wait_for_visible_locator", return_value=menu_root):
+            selected = _find_csv_menu_item(page)
 
         self.assertIs(selected, second_item)
 

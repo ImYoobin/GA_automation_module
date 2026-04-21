@@ -1274,7 +1274,22 @@ def _run_report_phase_for_account(
                 for retry_result in retry_results:
                     result_by_target[retry_result.target_key] = retry_result
 
-            download_results = [
+            missing_target_keys = [target_key for target_key in TARGET_ORDER if target_key not in matched_map]
+            failed_download_results = [
+                result_by_target.get(
+                    target_key,
+                    DownloadResult(
+                        target_key=target_key,
+                        success=False,
+                        activity_name=activity_name,
+                        activity_key=activity_key,
+                        reason="download result missing",
+                    ),
+                )
+                for target_key in TARGET_ORDER
+                if target_key in matched_map and not bool(result_by_target.get(target_key, None) and result_by_target[target_key].success)
+            ]
+            workbook_download_results = [
                 result_by_target.get(
                     target_key,
                     DownloadResult(
@@ -1287,18 +1302,27 @@ def _run_report_phase_for_account(
                 )
                 for target_key in TARGET_ORDER
             ]
-            final_successful_downloads = sum(
-                1 for result in download_results if result.success and result.filename
-            )
-            final_failed_results = [result for result in download_results if not result.success]
 
-            if final_failed_results:
+            if missing_target_keys or failed_download_results:
                 skipped_activities += 1
                 had_failures = True
+                missing_display_names = ", ".join(
+                    TARGET_DISPLAY_NAMES.get(target_key, target_key)
+                    for target_key in missing_target_keys
+                )
                 failed_display_names = ", ".join(
                     TARGET_DISPLAY_NAMES.get(result.target_key, result.target_key)
-                    for result in final_failed_results
+                    for result in failed_download_results
                 )
+                if missing_target_keys and failed_download_results:
+                    skip_message = (
+                        f"통합본 생성 스킵 (미매칭 리포트·뷰: {missing_display_names}; "
+                        f"다운로드 실패: {failed_display_names})"
+                    )
+                elif missing_target_keys:
+                    skip_message = f"통합본 생성 스킵 (미매칭 리포트·뷰: {missing_display_names})"
+                else:
+                    skip_message = f"통합본 생성 스킵 (다운로드 실패: {failed_display_names})"
                 _emit(
                     progress_cb,
                     {
@@ -1309,21 +1333,19 @@ def _run_report_phase_for_account(
                         "activity_key": activity_key,
                         "stage": "통합본",
                         "status": "Failed",
-                        "message": (
-                            f"\ud1b5\ud569\ubcf8 \uc0dd\uc131 \uc2a4\ud0b5 "
-                            f"({len(final_failed_results)}/{total_targets} \uc2e4\ud328: {failed_display_names})"
-                        ),
+                        "message": skip_message,
                         "processed_sheet_count": processed_sheet_count,
                         "total_sheet_count": matched_target_count,
                     },
                 )
                 if logger:
                     logger.warning(
-                        "skip unified workbook due to failed targets | account=%s(%s) | activity=%s | failed=%s",
+                        "skip unified workbook due to missing_or_failed_targets | account=%s(%s) | activity=%s | missing=%s | failed=%s",
                         account.name,
                         account.cid,
                         activity_name,
-                        [result.target_key for result in final_failed_results],
+                        missing_target_keys,
+                        [result.target_key for result in failed_download_results],
                     )
                 continue
 
@@ -1348,7 +1370,7 @@ def _run_report_phase_for_account(
                     account.name,
                     account.cid,
                     activity_name,
-                    [result.filename for result in download_results if result.filename],
+                    [result.filename for result in workbook_download_results if result.success and result.filename],
                 )
 
             def _emit_workbook_sheet_progress(
@@ -1457,7 +1479,7 @@ def _run_report_phase_for_account(
 
             output_path, summaries = create_unified_workbook_for_account(
                 account=account,
-                download_results=download_results,
+                download_results=workbook_download_results,
                 activity_name=activity_name,
                 output_dir=final_output_dir,
                 csv_dir=downloads_dir,

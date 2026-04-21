@@ -42,8 +42,9 @@ FILTER_APPLY_BUTTON_SELECTOR = "div.footer material-button[role='button'], div.f
 LAST_30_DAYS_BUTTON_SELECTOR = "material-button.go-to-last-30days-button"
 ALL_CHANGES_CHIP_SELECTOR = "change-type-filter-bar material-chip[role='option']"
 DOWNLOAD_BUTTON_SELECTOR = "material-menu.report-download-menu-item material-button[role='button'][aria-haspopup='menu'], material-menu.report-download-menu-item material-button"
-DOWNLOAD_MENU_ITEM_SELECTOR = "[role='menu'] material-select-item[role='menuitem']"
-EXACT_CSV_MENU_ITEM_SELECTOR = "material-select-item[role='menuitem'][aria-label='.csv']"
+DOWNLOAD_MENU_SELECTOR = "menu-item-groups[role='menu']"
+DOWNLOAD_MENU_ITEM_SELECTOR = f"{DOWNLOAD_MENU_SELECTOR} material-select-item[role='menuitem']"
+EXACT_CSV_MENU_ITEM_SELECTOR = f"{DOWNLOAD_MENU_SELECTOR} material-select-item[aria-label='.csv']"
 LOADING_OVERLAY_SELECTOR = "ipl-progress-indicator"
 LOADING_CONTAINER_SELECTOR = "progress-indicator"
 CHIPS_BUSY_SELECTOR = "material-chips[aria-busy]"
@@ -394,10 +395,18 @@ def _download_action_log_csv(page: Page, *, output_path: Path, logger=None) -> P
 
 
 def _find_csv_menu_item(page: Page, logger=None) -> Locator | None:
+    menu_root = None
+    try:
+        menu_root = _wait_for_visible_locator(page.locator(DOWNLOAD_MENU_SELECTOR), timeout_ms=UI_WAIT_TIMEOUT_MS)
+    except Exception:  # noqa: BLE001
+        menu_root = None
+
     direct_candidates = [
         page.locator(EXACT_CSV_MENU_ITEM_SELECTOR),
         page.get_by_role("menuitem", name=EXACT_CSV_REGEX),
     ]
+    if menu_root is not None:
+        direct_candidates.insert(0, menu_root.locator("material-select-item[aria-label='.csv']"))
     for locator in direct_candidates:
         candidate = _first_visible_locator(locator)
         if candidate is not None:
