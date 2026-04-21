@@ -15,6 +15,7 @@ from google_ads_exporter.action_log_downloader import (
     _click_with_retry,
     _download_action_log_csv,
     _ensure_all_changes_selected,
+    _find_csv_menu_item,
     _is_loading_state_blocking,
     _remove_existing_campaign_name_filter,
     _set_last_30_days,
@@ -153,6 +154,38 @@ class ActionLogDownloaderTests(unittest.TestCase):
         raw_download_path = build_action_log_raw_download_path(output_path)
         download.save_as.assert_called_once_with(str(raw_download_path))
         transform_mock.assert_called_once_with(raw_download_path=raw_download_path, output_path=output_path)
+
+    def test_find_csv_menu_item_falls_back_to_second_visible_item_after_excel_csv(self) -> None:
+        page = Mock()
+        exact_locator = Mock()
+        role_locator = Mock()
+        menu_locator = Mock()
+        first_item = Mock()
+        second_item = Mock()
+
+        page.locator.side_effect = lambda selector: {
+            "material-select-item[role='menuitem'][aria-label='.csv']": exact_locator,
+            "[role='menu'] material-select-item[role='menuitem']": menu_locator,
+            "material-select-item[role='menuitem']": menu_locator,
+        }[selector]
+        page.get_by_role.return_value = role_locator
+
+        exact_locator.count.return_value = 0
+        role_locator.count.return_value = 0
+        menu_locator.count.return_value = 2
+        menu_locator.nth.side_effect = [first_item, second_item, first_item, second_item]
+
+        first_item.is_visible.return_value = True
+        first_item.inner_text.return_value = "Excel .csv"
+        first_item.get_attribute.side_effect = lambda name: ""
+
+        second_item.is_visible.return_value = True
+        second_item.inner_text.side_effect = RuntimeError("text unavailable")
+        second_item.get_attribute.side_effect = lambda name: ""
+
+        selected = _find_csv_menu_item(page)
+
+        self.assertIs(selected, second_item)
 
     def test_transform_action_log_csv_rewrites_download_to_template_columns(self) -> None:
         raw_path = self._tests_dir / "_tmp_action_log_transform_raw.csv"

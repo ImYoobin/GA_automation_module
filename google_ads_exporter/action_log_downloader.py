@@ -59,6 +59,8 @@ POLL_INTERVAL_MS = 400
 CAMPAIGN_NAME_REGEX = re.compile(r"Campaign name|\ucea0\ud398\uc778 \uc774\ub984", re.IGNORECASE)
 STARTS_WITH_REGEX = re.compile(r"starts with|\uc2dc\uc791", re.IGNORECASE)
 CSV_REGEX = re.compile(r"\.csv", re.IGNORECASE)
+EXACT_CSV_REGEX = re.compile(r"^\s*\.csv\s*$", re.IGNORECASE)
+EXCEL_CSV_REGEX = re.compile(r"excel\s*\.csv", re.IGNORECASE)
 
 ActionLogProgressCallback = Callable[[AdsAccount, str, str, str, str], None]
 ACTION_LOG_OUTPUT_HEADERS = ("User / Date & Time", "Tool", "Change", "Campaign", "Ad group")
@@ -367,12 +369,7 @@ def _download_action_log_csv(page: Page, *, output_path: Path, logger=None) -> P
         raise RuntimeError("change-history download button not found")
     _click_with_retry(button, page=page, description="change-history download button", logger=logger)
 
-    csv_item = _first_visible_locator(page.locator(EXACT_CSV_MENU_ITEM_SELECTOR))
-    if csv_item is None:
-        menu_items = _wait_for_locator(page.locator(DOWNLOAD_MENU_ITEM_SELECTOR), timeout_ms=UI_WAIT_TIMEOUT_MS)
-        csv_item = _first_visible_locator(page.locator(EXACT_CSV_MENU_ITEM_SELECTOR))
-        if csv_item is None:
-            csv_item = _find_locator_by_text(menu_items, CSV_REGEX, preferred_index=1, visible_only=True)
+    csv_item = _find_csv_menu_item(page, logger=logger)
     if csv_item is None:
         raise RuntimeError("change-history csv menu item not found")
 
@@ -394,6 +391,40 @@ def _download_action_log_csv(page: Page, *, output_path: Path, logger=None) -> P
     if logger:
         logger.info("action log saved | path=%s", output_path)
     return output_path
+
+
+def _find_csv_menu_item(page: Page, logger=None) -> Locator | None:
+    direct_candidates = [
+        page.locator(EXACT_CSV_MENU_ITEM_SELECTOR),
+        page.get_by_role("menuitem", name=EXACT_CSV_REGEX),
+    ]
+    for locator in direct_candidates:
+        candidate = _first_visible_locator(locator)
+        if candidate is not None:
+            return candidate
+
+    menu_items = _wait_for_locator(page.locator(DOWNLOAD_MENU_ITEM_SELECTOR), timeout_ms=UI_WAIT_TIMEOUT_MS)
+    visible_items = _visible_locators(menu_items)
+    if not visible_items:
+        visible_items = _visible_locators(page.locator("material-select-item[role='menuitem']"))
+
+    for candidate in visible_items:
+        if _locator_text_matches(candidate, EXACT_CSV_REGEX):
+            return candidate
+
+    for candidate in visible_items:
+        if _locator_text_matches(candidate, CSV_REGEX) and not _locator_text_matches(candidate, EXCEL_CSV_REGEX):
+            return candidate
+
+    if len(visible_items) > 1 and _locator_text_matches(visible_items[0], EXCEL_CSV_REGEX):
+        return visible_items[1]
+
+    if logger:
+        logger.warning(
+            "change-history csv menu lookup failed | visible_items=%s",
+            [_describe_locator(candidate) for candidate in visible_items],
+        )
+    return None
 
 
 def _find_download_button(page: Page) -> Locator | None:
@@ -884,6 +915,20 @@ def _first_visible_locator(locator: Locator) -> Locator | None:
             return candidate
     return None
 
+
+def _visible_locators(locator: Locator) -> list[Locator]:
+    items: list[Locator] = []
+    try:
+        count = locator.count()
+    except Exception:  # noqa: BLE001
+        return items
+
+    for idx in range(count):
+        candidate = locator.nth(idx)
+        if _locator_is_visible(candidate):
+            items.append(candidate)
+    return items
+
 def _find_locator_by_text(
     locator: Locator,
     pattern: re.Pattern[str],
@@ -925,6 +970,14 @@ def _safe_inner_text(locator: Locator) -> str:
         return str(locator.inner_text(timeout=1_000) or "").strip()
     except Exception:  # noqa: BLE001
         return ""
+
+
+def _describe_locator(locator: Locator) -> str:
+    text = _safe_inner_text(locator)
+    label = str(locator.get_attribute("aria-label") or "").strip()
+    if text and label:
+        return f"{label} | {text}"
+    return label or text or "<empty>"
 
 
 def _locator_is_visible(locator: Locator) -> bool:

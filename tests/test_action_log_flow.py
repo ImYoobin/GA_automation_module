@@ -188,6 +188,26 @@ class ActionLogFlowTests(unittest.TestCase):
         self.assertEqual(action_mock.call_count, 1)
         self.assertEqual(call_order, ["report", "action"])
 
+    def test_dual_mode_keeps_action_log_flow_when_workbook_is_skipped(self) -> None:
+        events, report_mock, action_mock, _scan_rows = self._run_flow(
+            enable_report_download=True,
+            enable_action_log_download=True,
+            report_helper_side_effect=(0, 1, True),
+            action_helper_side_effect=(1, False),
+        )
+
+        self.assertEqual(report_mock.call_count, 1)
+        self.assertEqual(action_mock.call_count, 1)
+        history_waiting_events = [
+            event
+            for event in events
+            if event.get("type") == "action_log_update" and event.get("status") == "Waiting"
+        ]
+        self.assertEqual(len(history_waiting_events), 1)
+        self.assertEqual(history_waiting_events[0]["message"], "캠페인 데이터 다운로드 진행중입니다.")
+        completed_event = next(event for event in events if event.get("type") == "run_completed")
+        self.assertIn("통합본 스킵 1개", completed_event.get("message", ""))
+
     def test_dual_mode_seeds_report_rows_and_workbook_waiting_rows(self) -> None:
         events, _report_mock, _action_mock, _scan_rows = self._run_flow(
             enable_report_download=True,
