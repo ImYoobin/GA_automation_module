@@ -57,6 +57,7 @@ DEFAULT_USER_PARENT_DIR_TOKEN = "%USERPROFILE%"
 INVALID_RUNTIME_PATH_MESSAGE = "올바르지 않은 부모 경로입니다. 로컬 PC의 폴더 경로를 입력해주세요."
 _WINDOWS_ABS_DRIVE_RE = re.compile(r"^[A-Za-z]:\\")
 _WINDOWS_DRIVE_TOKEN_RE = re.compile(r"[A-Za-z]:\\")
+UI_BROWSER_OPTIONS: tuple[str, ...] = ("msedge", "chrome")
 
 
 def run_streamlit_app() -> None:
@@ -112,6 +113,17 @@ def _default_runtime_settings() -> dict[str, str]:
         "browser": "msedge",
         "base_parent_dir": DEFAULT_USER_PARENT_DIR_TOKEN,
     }
+
+
+def _normalize_ui_browser(value: Any, *, default: str = "msedge") -> tuple[str, bool]:
+    normalized = _safe_text(value).lower()
+    if normalized in UI_BROWSER_OPTIONS:
+        return normalized, False
+    if normalized in {"auto", "chromium"}:
+        return default, True
+    if normalized:
+        return default, True
+    return default, False
 
 
 def _current_run_date_token() -> str:
@@ -222,12 +234,9 @@ def _sanitize_loaded_runtime_settings(runtime_settings: dict[str, str]) -> tuple
     }
     has_invalid = False
 
-    raw_browser = _safe_text(runtime_settings.get("browser")).lower()
-    if raw_browser:
-        if raw_browser in {"msedge", "chrome", "auto", "chromium"}:
-            sanitized["browser"] = raw_browser
-        else:
-            has_invalid = True
+    normalized_browser, browser_was_adjusted = _normalize_ui_browser(runtime_settings.get("browser"))
+    sanitized["browser"] = normalized_browser
+    has_invalid = has_invalid or browser_was_adjusted
 
     raw_parent_dir = _safe_text(runtime_settings.get("base_parent_dir")) or _infer_base_parent_dir_from_legacy_settings(
         runtime_settings
@@ -425,9 +434,10 @@ def _load_runtime_settings(base_dir: Path) -> dict[str, str]:
 def _runtime_settings_payload(base_dir: Path) -> dict[str, str]:
     _ = base_dir
     defaults = _default_runtime_settings()
-    browser = _safe_text(st.session_state.get("browser")).lower() or defaults["browser"]
-    if browser not in {"msedge", "chrome", "auto", "chromium"}:
-        browser = defaults["browser"]
+    browser, _ = _normalize_ui_browser(
+        st.session_state.get("browser"),
+        default=defaults["browser"],
+    )
     return {
         "browser": browser,
         "base_parent_dir": _serialize_base_parent_dir_for_settings(
@@ -545,12 +555,20 @@ def _init_session_state() -> None:
         st.session_state["_runtime_path_error"] = INVALID_RUNTIME_PATH_MESSAGE
 
     st.session_state.setdefault("env_file", ".env")
+    initial_browser, browser_was_adjusted = _normalize_ui_browser(
+        runtime_settings.get("browser") or _safe_text(os.getenv("GOOGLE_ADS_BROWSER", "msedge")).lower() or "msedge"
+    )
     st.session_state.setdefault(
         "browser",
-        runtime_settings.get("browser") or _safe_text(os.getenv("GOOGLE_ADS_BROWSER", "msedge")).lower() or "msedge",
+        initial_browser,
     )
-    if _safe_text(st.session_state.get("browser")).lower() not in {"msedge", "chrome", "auto", "chromium"}:
-        st.session_state["browser"] = runtime_settings["browser"]
+    normalized_browser, browser_session_adjusted = _normalize_ui_browser(
+        st.session_state.get("browser"),
+        default=runtime_settings["browser"],
+    )
+    if normalized_browser != _safe_text(st.session_state.get("browser")).lower():
+        st.session_state["browser"] = normalized_browser
+    if browser_was_adjusted or browser_session_adjusted:
         st.session_state["_runtime_settings_needs_heal"] = True
     st.session_state.setdefault(
         "target_map_path",
@@ -592,10 +610,8 @@ def _init_session_state() -> None:
 def _render_sidebar_execution_section(snapshot: dict[str, Any]) -> None:
     with st.sidebar:
         st.subheader("⚙️ Run Settings")
-        browser_options = ["msedge", "chrome", "auto", "chromium"]
-        current_browser = _safe_text(st.session_state.get("browser", "msedge")).lower()
-        if current_browser not in browser_options:
-            current_browser = "msedge"
+        browser_options = list(UI_BROWSER_OPTIONS)
+        current_browser, _ = _normalize_ui_browser(st.session_state.get("browser", "msedge"))
         st.session_state["browser"] = st.selectbox(
             "브라우저",
             options=browser_options,

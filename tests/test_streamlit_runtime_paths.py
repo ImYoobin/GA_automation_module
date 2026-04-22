@@ -9,6 +9,12 @@ import google_ads_exporter.streamlit_app as streamlit_app
 
 
 class StreamlitRuntimePathTests(unittest.TestCase):
+    def test_normalize_ui_browser_maps_hidden_options_to_msedge(self) -> None:
+        self.assertEqual(streamlit_app._normalize_ui_browser("auto"), ("msedge", True))
+        self.assertEqual(streamlit_app._normalize_ui_browser("chromium"), ("msedge", True))
+        self.assertEqual(streamlit_app._normalize_ui_browser("msedge"), ("msedge", False))
+        self.assertEqual(streamlit_app._normalize_ui_browser("chrome"), ("chrome", False))
+
     def test_build_run_storage_paths_from_parent_dir(self) -> None:
         paths = streamlit_app._build_run_storage_paths(r"C:\Users\tester", "20260416")
 
@@ -31,6 +37,17 @@ class StreamlitRuntimePathTests(unittest.TestCase):
         self.assertFalse(has_invalid)
         self.assertEqual(sanitized["base_parent_dir"], str(Path.home()))
 
+    def test_sanitize_loaded_runtime_settings_normalizes_hidden_browser_to_msedge(self) -> None:
+        sanitized, has_invalid = streamlit_app._sanitize_loaded_runtime_settings(
+            {
+                "browser": "chromium",
+                "base_parent_dir": r"%USERPROFILE%",
+            }
+        )
+
+        self.assertTrue(has_invalid)
+        self.assertEqual(sanitized["browser"], "msedge")
+
     def test_runtime_settings_payload_serializes_home_as_userprofile(self) -> None:
         fake_st = SimpleNamespace(
             session_state={
@@ -43,6 +60,19 @@ class StreamlitRuntimePathTests(unittest.TestCase):
             payload = streamlit_app._runtime_settings_payload(Path("."))
 
         self.assertEqual(payload["base_parent_dir"], "%USERPROFILE%")
+
+    def test_runtime_settings_payload_normalizes_hidden_browser_to_msedge(self) -> None:
+        fake_st = SimpleNamespace(
+            session_state={
+                "browser": "auto",
+                "base_parent_dir": str(Path.home()),
+            }
+        )
+
+        with patch.object(streamlit_app, "st", fake_st):
+            payload = streamlit_app._runtime_settings_payload(Path("."))
+
+        self.assertEqual(payload["browser"], "msedge")
 
     def test_apply_runtime_settings_uses_output_and_trace_dirs(self) -> None:
         fake_st = SimpleNamespace(
